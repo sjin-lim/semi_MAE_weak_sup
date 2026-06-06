@@ -444,12 +444,59 @@ def do_train(cfg, model, resume=False):
     else:
         global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size()
 
-    # Build data loader
+    # Build data loader (unlabeled SSL)
     data_loader = build_multi_resolution_data_loader_from_cfg(
         cfg=cfg,
         model=model,
         start_iter=start_iter,
     )
+
+    # ── Weak Supervision branch: wrap with RatioMixedLoader ──────────────
+    weak_sup_enabled = getattr(cfg, "weak_sup", None) is not None and getattr(cfg.weak_sup, "enabled", False)
+    if weak_sup_enabled:
+        from dinov3.train.weaksup.integration import build_labeled_loader_from_cfg
+        from dinov3.train.weaksup.mixed_loader import RatioMixedLoader
+
+        # Recreate masking generator for labeled collate (same as unlabeled)
+        img_size_for_mask = (
+            cfg.crops.global_crops_size if isinstance(cfg.crops.global_crops_size, int)
+            else cfg.crops.global_crops_size[0]
+        )
+        patch_size_for_mask = int(cfg.student.patch_size * cfg.crops.teacher_to_student_resolution_scale)
+        grid_size_for_mask = (img_size_for_mask // patch_size_for_mask,) * 2
+        n_tokens_for_mask = grid_size_for_mask[0] * grid_size_for_mask[1]
+
+        _random_mask_gen = MaskingGenerator(
+            input_size=grid_size_for_mask,
+            max_num_patches=0.5 * n_tokens_for_mask,
+        )
+        if getattr(cfg.ibot, "information_aware_masking", False):
+            _mask_gen = InformationAwareMaskingGenerator(
+                input_size=grid_size_for_mask,
+                temperature=getattr(cfg.ibot, "masking_temperature", 0.5),
+                fallback_generator=_random_mask_gen,
+            )
+        else:
+            _mask_gen = _random_mask_gen
+
+        _dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+        labeled_loader = build_labeled_loader_from_cfg(
+            cfg=cfg,
+            mask_generator=_mask_gen,
+            dtype=_dtype_map[cfg.compute_precision.param_dtype],
+            n_tokens=n_tokens_for_mask,
+        )
+
+        data_loader = RatioMixedLoader(
+            unlabeled_loader=data_loader,
+            labeled_loader=labeled_loader,
+            labeled_ratio=cfg.weak_sup.labeled_ratio,
+            seed=cfg.train.seed,
+        )
+        logger.info(
+            f"[weak_sup] Mixed loader active. labeled_ratio={cfg.weak_sup.labeled_ratio}, "
+            f"T={cfg.weak_sup.T}, lambda_W={cfg.weak_sup.lambda_W}"
+        )
 
     # Metric logging
     logger.info("Starting training from iteration %d", start_iter)
@@ -520,7 +567,11 @@ def do_train(cfg, model, resume=False):
 
         # Forward backward
         optimizer.zero_grad(set_to_none=True)
-        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+        # weak_sup: data["is_labeled"] flag (set by RatioMixedLoader). Default False.
+        _is_labeled = bool(data.get("is_labeled", False))
+        total_loss, metrics_dict = model.forward_backward(
+            data, teacher_temp=teacher_temp, iteration=it, is_labeled=_is_labeled,
+        )
 
         # Gradient clipping
         if cfg.optim.clip_grad:

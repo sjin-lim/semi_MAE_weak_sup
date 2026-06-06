@@ -353,7 +353,7 @@ class SSLMetaArch(nn.Module):
             logger.info(f"Performing distillation from: {self.teacher}")
 
     def forward_backward(
-        self, data, *, teacher_temp, iteration=0, **ignored_kwargs
+        self, data, *, teacher_temp, iteration=0, is_labeled: bool = False, **ignored_kwargs
     ) -> tuple[Tensor, dict[str, float | Tensor]]:
         del ignored_kwargs
         metrics_dict = {}
@@ -422,6 +422,82 @@ class SSLMetaArch(nn.Module):
             masks_weight=masks_weight,
             iteration=iteration,
         )
+
+        # ── Weak Supervision branch ─────────────────────────────────────
+        # is_labeled=True 인 경우 student global patch features + patch labels 로
+        # per-patch pair-wise loss 계산하여 total loss 에 가산.
+        weak_sup_cfg = getattr(self.cfg, "weak_sup", None)
+        weak_sup_enabled = weak_sup_cfg is not None and getattr(weak_sup_cfg, "enabled", False)
+        if is_labeled and weak_sup_enabled and "patch_labels" in data:
+            try:
+                from dinov3.train.weaksup.losses import (
+                    per_patch_pairwise_loss, compute_pair_sim_stats,
+                )
+
+                # student_global["patch_pre_head"] shape: [n_global_crops, B, P, D]
+                stu_patches = student_global["patch_pre_head"]  # (n_global, B, P, D)
+                n_g, Bw, P, D = stu_patches.shape
+                stu_patches_flat = stu_patches.reshape(n_g * Bw, P, D)
+
+                # patch_labels: (n_global * B, P) — collate 에서 같은 ordering 으로 stacking
+                patch_labels = data["patch_labels"].to(stu_patches.device)
+                assert patch_labels.shape[0] == stu_patches_flat.shape[0], (
+                    f"patch_labels {patch_labels.shape} vs patches {stu_patches_flat.shape}"
+                )
+
+                # Lambda warmup
+                warmup = max(int(getattr(weak_sup_cfg, "warmup_steps", 0)), 1)
+                lambda_w = float(weak_sup_cfg.lambda_W) * min(iteration / warmup, 1.0)
+
+                per_image_losses = []
+                pair_stat_acc = {"pair_sim_max": 0.0, "pair_sim_mean": 0.0, "n_pairs": 0}
+                n_valid = 0
+                for i in range(stu_patches_flat.shape[0]):
+                    feats_i = stu_patches_flat[i]
+                    labels_i = patch_labels[i]
+                    loss_i = per_patch_pairwise_loss(
+                        feats_i, labels_i,
+                        T=float(weak_sup_cfg.T),
+                        background_class=int(weak_sup_cfg.background_class),
+                        min_patches_per_class=int(weak_sup_cfg.min_patches_per_class),
+                        skip_background=bool(weak_sup_cfg.skip_background),
+                    )
+                    if loss_i.item() > 0:
+                        per_image_losses.append(loss_i)
+                        n_valid += 1
+                    if getattr(weak_sup_cfg, "log_pair_stats", False):
+                        stats = compute_pair_sim_stats(
+                            feats_i, labels_i,
+                            background_class=int(weak_sup_cfg.background_class),
+                            min_patches_per_class=int(weak_sup_cfg.min_patches_per_class),
+                            skip_background=bool(weak_sup_cfg.skip_background),
+                        )
+                        if stats:
+                            pair_stat_acc["pair_sim_max"] = max(
+                                pair_stat_acc["pair_sim_max"], stats["pair_sim_max"]
+                            )
+                            pair_stat_acc["pair_sim_mean"] += stats["pair_sim_mean"]
+                            pair_stat_acc["n_pairs"] += stats["n_pairs"]
+
+                if per_image_losses:
+                    L_weak = torch.stack(per_image_losses).mean()
+                    loss_accumulator = loss_accumulator + lambda_w * L_weak
+                    loss_dict["weak_loss"] = L_weak.detach()
+                    loss_dict["lambda_w"] = torch.as_tensor(lambda_w, device=L_weak.device)
+                    if getattr(weak_sup_cfg, "log_pair_stats", False) and n_valid > 0:
+                        loss_dict["pair_sim_max"] = torch.as_tensor(
+                            pair_stat_acc["pair_sim_max"], device=L_weak.device
+                        )
+                        loss_dict["pair_sim_mean"] = torch.as_tensor(
+                            pair_stat_acc["pair_sim_mean"] / max(n_valid, 1), device=L_weak.device
+                        )
+                else:
+                    # 모든 image 가 self-curriculum 이후 → loss 0
+                    loss_dict["weak_loss"] = torch.zeros((), device=stu_patches.device)
+                    loss_dict["lambda_w"] = torch.as_tensor(lambda_w, device=stu_patches.device)
+            except Exception as e:
+                logger.error(f"[weak_sup] forward_backward error: {e}")
+                raise
 
         self.backprop_loss(loss_accumulator)
 
