@@ -1,0 +1,249 @@
+# ============================================================
+# semi_MAE — DINOv3 ViT-B High-Resolution Adaptation (v5-hires)
+#
+# 목적:
+#   v4_ibot_ft 위에 DINOv3 Sec 5.1 스타일 high-resolution adaptation 적용
+#   - global crop을 448 단일 → {512, 768} 혼합으로
+#   - patch density ↑ → 옅은 boundary(1-2 픽셀)가 patch 1개에서 평균화되는 문제 완화
+#   - Gram anchoring ON: dense feature 안정화 (DINOv3 논문 핵심)
+#   - Gram teacher = v4_ibot_ft teacher (EM 도메인 적응 + dense feature 건강한 상태)
+#
+# 핵심 설계:
+#   1. resume_from_teacher_chkpt = v4_ibot_ft 의 teacher_checkpoint.pth
+#   2. Gram teacher 도 동일 체크포인트 (논문에서 "초기 안정 teacher" 권장과 일치)
+#   3. 짧고 cheap: 10 epoch ≈ 12.8K iteration (논문도 high-res adapt 10K iter)
+#   4. LR 매우 낮음 (cooldown): 1.25e-5 → 1e-6
+#
+# 총 학습량:
+#   10 epochs × 1280 steps = 12,800 total steps
+#   global batch 128 (32/GPU × 4 GPU)
+#   163K × 10 epoch ≈ 1.6M 이미지 노출
+#
+# VRAM 고려:
+#   ViT-B + crop 768 → patch 2304개, attention ~9x 비용
+#   batch_size_per_gpu 128 → 32 로 축소
+#   Gram teacher inference (1152 해상도, patch 5184) 까지 고려
+#
+# 실행:
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_vitb_v5_hires_adapt.yaml \
+#       --no-resume \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       train.output_dir=/path/to/output_v5_hires_adapt \
+#       student.resume_from_teacher_chkpt=/path/to/v4_ibot_ft/.../teacher_checkpoint.pth \
+#       gram.ckpt=/path/to/v4_ibot_ft/.../teacher_checkpoint.pth
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  # v4_ibot_ft 의 강화된 iBOT 설정 유지
+  loss_weight: 1.5
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+  mask_random_circular_shift: false
+  information_aware_masking: true
+  masking_temperature: 0.3
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+
+gram:
+  # ── Gram Anchoring ON ──────────────────────────────────────────────
+  # DINOv3 Sec 5.1: high-res adapt의 essential component
+  # "without it, the model performance on dense prediction tasks degrades significantly"
+  use_loss: true
+  compute_stats: false
+  loss_weight: 1.5
+  ema_teacher: false
+  # ── Gram teacher 체크포인트 ────────────────────────────────────────
+  # CLI로 override: gram.ckpt=/path/to/v4_ibot_ft/eval/.../teacher_checkpoint.pth
+  ckpt: ''
+  it_load_ema_teacher: -1
+  rep_update: false
+  update_frequency: 10000
+  it_first_update: 0          # 학습 시작부터 gram 적용 (이미 안정된 teacher라 OK)
+  max_updates: 0              # gram teacher 고정 (rep_update + max_updates=0 → 한 번만 로드)
+  normalized: true
+  img_level: true             # 논문 7B 학습과 동일
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+  loss_weight_schedule:
+    start: 0.5                # 점진적 증가로 학습 초기 충격 완화
+    peak: 1.5
+    end: 1.5
+    warmup_epochs: 2
+    cosine_epochs: 0
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./output_dino_em_vitb_v5_hires_adapt"
+
+  # ── 배치 크기 ─────────────────────────────────────────────────────────
+  # ViT-B + crop 768 → patch 2304, attention 비용 ~9x
+  # Gram teacher inference (1152, patch 5184) 까지 + bf16 → batch 32 권장
+  batch_size_per_gpu: 32
+  num_workers: 10
+  seed: 0
+
+  # ── OFFICIAL_EPOCH_LENGTH ──────────────────────────────────────────────
+  # 163,594 / (32 × 4 GPU) = 1278 → 1280 step = 1 epoch
+  OFFICIAL_EPOCH_LENGTH: 1280
+
+  saveckp_freq: 2
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_base
+  patch_size: 16
+  pretrained_weights: ''
+  # ── v4_ibot_ft teacher 에서 resume ───────────────────────────────────
+  # CLI override: student.resume_from_teacher_chkpt=/path/to/teacher_checkpoint.pth
+  resume_from_teacher_chkpt: ''
+
+  drop_path_rate: 0.2
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  # high-res adapt은 짧고 LR 낮음 → momentum 매우 보수적으로
+  momentum_teacher: 0.999
+  final_momentum_teacher: 0.9999
+  warmup_teacher_temp: 0.07
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0
+
+optim:
+  epochs: 10                          # high-res adapt: 짧게
+  optimizer: adamw
+  weight_decay: 0.15
+  weight_decay_end: 0.15
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 0.9
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  # ── 핵심: Mixed-resolution global crops ───────────────────────────────
+  # 448 → {512, 768} 혼합으로 patch density 증가
+  # 1-2 픽셀 boundary 가 patch 1개에서 평균화되는 문제 완화
+  global_crops_size:
+    - 512
+    - 768
+  local_crops_size:
+    - 128
+    - 192
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  local_crops_number: 8
+  # 50:50 비율로 두 해상도 혼합
+  global_local_crop_pairs_ratios:
+    - 0.5
+    - 0.5
+  # ── Gram teacher 해상도 (보통 global의 1.5x) ─────────────────────────
+  # 더 큰 해상도에서 feature 추출 후 down-sample 하여 smoother gram matrix
+  gram_teacher_crops_size:
+    - 768
+    - 1152
+  gram_teacher_no_distortions: true   # gram teacher 입력에 distortion 제외 (논문 권장)
+  localcrops_subset_of_globalcrops: false
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: true
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  # 12,800 total / 8 = 1,600 step 간격
+  period: 1600
+  max_to_keep: 5
+  keep_every: 99999999999999
+
+evaluation:
+  # 3200 step (≈ 2.5 epoch) 마다 teacher checkpoint 저장
+  eval_period_iterations: 3200
+
+schedules:
+  weight_decay:
+    start: 0.15
+    peak: 0.15
+    end: 0.15
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.07
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 0
+  lr:
+    start: 0
+    # ── LR: cooldown 스타일 ────────────────────────────────────────────
+    # v4_ibot_ft 의 0.00005 보다 더 낮게 → 기존 representation 거의 보존
+    # sqrt_wrt_1024 scaling 후: 4 × sqrt(128/1024) × 1.25e-5 ≈ 1.77e-5
+    peak: 1.25e-05
+    end: 1.0e-06
+    warmup_epochs: 1
+    freeze_last_layer_epochs: 0
+    cosine_epochs: 9                  # warmup(1) + cosine(9) = 10 총 epoch
+  momentum:
+    start: 0.999
+    peak: 0.999
+    end: 0.9999
+    warmup_epochs: 0

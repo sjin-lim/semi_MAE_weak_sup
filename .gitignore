@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Training outputs
+out/
+output_*/
+*.log
+tensorboard/
+checkpoints/
+
+# Data
+labeled_data/
+shards/
+*.tar
+*.h5
+*.hdf5
+
+# Local config
+.env
+*.local.yaml
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

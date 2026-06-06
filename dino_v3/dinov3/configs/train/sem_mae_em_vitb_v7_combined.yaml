@@ -1,0 +1,220 @@
+# ============================================================
+# semi_MAE — DINOv3 ViT-B v7 Combined (Augmentation + Masking Refined)
+#
+# 통합 변경 사항 (v4_ibot_ft 대비):
+#   1) Augmentation (v6d 와 동일):
+#      - CLAHE: OFF (inference 단 검증으로 harmful 확인)
+#      - Disk Blur: 확률 약화 (1.0/0.1/0.5 → 0.3/0.05/0.2)
+#      - Gamma/Poisson: 유지 (현실적 + boundary 신호 보존)
+#
+#   2) Masking:
+#      - information_aware_masking: true → false (DINOv3 default 랜덤)
+#      - 이유: interior 만 마스킹하는 현재 전략이 "1, 2 interior 를 같게 학습"
+#              하는 방향으로 작용 가능
+#      - 랜덤 마스킹은 boundary 패치도 균등하게 마스킹 → boundary 표현 강화
+#
+# 학습량:
+#   150 epoch × 320 step = 48,000 total steps
+#   ≈ 20~27 시간 (4×H200, ViT-B + 448)
+#   주말 + 월요일 새벽까지 안전 범위
+#
+# 후속 계획:
+#   v7 끝나면 → v7_hires_adapt (high-res 적응) 추가 학습 (~12시간)
+#
+# 실행:
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_vitb_v7_combined.yaml \
+#       --no-resume \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       train.output_dir=/path/to/output_v7_combined \
+#       student.resume_from_teacher_chkpt=/path/to/v4_ibot_ft/.../teacher_checkpoint.pth
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  loss_weight: 1.5
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+  mask_random_circular_shift: false
+  # ── 핵심 변경: 랜덤 마스킹 ──────────────────────────────────────────
+  # information_aware = true 였을 때: interior(저정보) 패치만 반복 마스킹
+  # → 모델이 "boundary 옆의 interior 채우기" 만 학습
+  # → 1, 2 interior 간 미세 차이가 학습 신호로 들어가지 않음
+  # 랜덤으로 바꾸면 boundary 패치도 균등하게 마스킹 → boundary 예측 task 추가
+  information_aware_masking: false
+  masking_temperature: 0.5      # information_aware off 시 무관하지만 safe default
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+
+gram:
+  use_loss: false
+  compute_stats: false
+  loss_weight: 0.0
+  ema_teacher: false
+  ckpt: null
+  it_load_ema_teacher: -1
+  rep_update: false
+  update_frequency: 10000
+  it_first_update: 999999999
+  max_updates: 0
+  normalized: true
+  img_level: true
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./output_dino_em_vitb_v7_combined"
+
+  batch_size_per_gpu: 128
+  num_workers: 10
+  seed: 0
+  OFFICIAL_EPOCH_LENGTH: 320
+
+  saveckp_freq: 20
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_base
+  patch_size: 16
+  pretrained_weights: ''
+  resume_from_teacher_chkpt: ''       # CLI override
+  drop_path_rate: 0.2
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.998
+  final_momentum_teacher: 0.9999    # 장기 학습 → final 더 높게
+  warmup_teacher_temp: 0.07
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0
+
+optim:
+  epochs: 60                         # 150 → 60 (학습 시간 단축, 약 2.4일)
+  optimizer: adamw
+  weight_decay: 0.15
+  weight_decay_end: 0.15
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 0.9
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 224
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  local_crops_number: 8
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: false
+  intensity_aug:
+    clahe_p: 0.0
+    gamma_p: 0.5
+    poisson_p: 0.3
+    disk_blur_p_global1: 0.3
+    disk_blur_p_global2: 0.05
+    disk_blur_p_local: 0.2
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  # 60 epoch × 320 = 19,200 total step / 8 = 2,400 step (≈ 7.5 epoch) 간격
+  period: 2400
+  max_to_keep: 8
+  keep_every: 99999999999999
+
+evaluation:
+  # 3200 step (≈ 10 epoch) 마다 teacher checkpoint 저장 → 6회
+  eval_period_iterations: 3200
+
+schedules:
+  weight_decay:
+    start: 0.15
+    peak: 0.15
+    end: 0.15
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.07
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 0
+  lr:
+    start: 0
+    # ── LR schedule (60 epoch 단축 버전) ──────────────────────────────
+    # v7 은 CLAHE invariance 해제 + random masking 재학습 필요 → v4_ibot_ft 의
+    # "최소 변화" LR (5e-5) 로는 부족. v4 의 "도메인 적응" LR (2e-4) 보다는 낮게.
+    #
+    # peak 1e-4 → sqrt_wrt_1024 scaling 후 effective ~2.83e-4
+    # warmup 5 + cosine 55 = 60 epoch (단축에 맞춰 비율 유지)
+    peak: 0.0001
+    end: 1.0e-06
+    warmup_epochs: 5
+    freeze_last_layer_epochs: 0
+    cosine_epochs: 55
+  momentum:
+    start: 0.998
+    peak: 0.998
+    end: 0.9999
+    warmup_epochs: 0

@@ -1,0 +1,251 @@
+# ============================================================
+# semi_MAE — 전자현미경(TEM/SEM) 이미지 DINOv3 학습 설정 (v2)
+#
+# v1 대비 변경 사항:
+#   - 데이터 30만 장 확장 대응 (OFFICIAL_EPOCH_LENGTH, total step 재계산)
+#   - LR peak 0.0002 → 0.0003 (데이터 3배 → 과적합 위험↓, 학습 강도↑)
+#   - layerwise_decay 0.9 → 0.93 (하위 레이어도 EM 도메인 적응 허용, 단 급격한 파괴 방지)
+#   - warmup 10 → 15 epoch (데이터 많아진 만큼 안정적 warmup)
+#   - drop_path_rate 0.1 → 0.15 (데이터 증가에 맞춰 regularization 소폭 강화)
+#   - weight_decay_end 0.1 → 0.12 (후반부 regularization 소폭 강화)
+#   - epochs 100 유지 (step 기준: 300K/512≈586 step/epoch × 100 = 58,600 step)
+#   - 저분산 이미지 필터링(min_std) + mask_ratio 0.3 상한은 v1에서 이미 적용
+#
+# 설계 철학:
+#   pretrained weight의 attention 구조/feature hierarchy는 초반에 보호하되,
+#   최종적으로는 EM 도메인 전용 foundation model로 완전히 전이되어야 함.
+#   → "점진적 해방": warmup 동안 보호 → cosine decay 구간에서 자연스럽게 풀림
+#
+# 사용 시나리오:
+#   v1 체크포인트에서 이어서 학습하거나,
+#   30만 장 데이터로 처음부터 pretrained init 학습.
+#
+# 실행:
+#   cd dino_v3
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_pretrain_v2.yaml \
+#       train.dataset_path="SemiMAE:h5_path=/path/to/train.h5" \
+#       train.output_dir=/path/to/output
+#
+# ── pretrained_weights 로드 흐름 ──────────────────────────────────────
+#   do_train() → model.init_weights()
+#     → student.backbone.init_weights()  [student.pretrained_weights 경로 로드]
+#     → model_ema.load_state_dict(student.state_dict())  [teacher = student 복사]
+#   ※ dino_head / ibot_head 는 랜덤 초기화 유지
+#   ※ student.pretrained_weights 가 비어 있으면 random init (처음부터 학습)
+#
+# ── pretrained 모델과 아키텍처가 반드시 일치해야 하는 항목 ────────────
+#   n_storage_tokens, mask_k_bias, qkv_bias, ffn_layer, norm_layer
+#
+# dataset_path 형식 (SemiMAEDataset):
+#   SemiMAE:h5_path=/path/to/file.h5
+#   SemiMAE:csv_path=/path/to/train.pkl
+#   SemiMAE:h5_path=/path/to/file.h5:use_filtered_target=true
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  # 30만 장 기준: 65536 prototypes ≈ dataset의 22% → 충분히 over-complete
+  # v1에서 확장 대비해 설정한 값 그대로 유지
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  # mask_ratio 상한 0.3 유지 (v1에서 조정 완료)
+  # 30만 장에서도 EM 이미지 특성상 0.3이 적절
+  # 데이터가 충분히 늘면 0.35까지 시도 가능하나 우선 보수적 유지
+  mask_ratio_min_max:
+    - 0.1
+    - 0.3
+  mask_random_circular_shift: false
+  # ── 정보량 기반 마스킹 (Information-aware masking) ────────────────────
+  # 패치별 픽셀 표준편차를 계산하여 저정보(균일 배경) 패치를 우선 마스킹.
+  # 구조적 패치(결정립계, 전위 등)를 context로 보존 → iBOT 학습 안정화.
+  # temperature: 낮을수록 저정보 패치 집중, 높을수록 랜덤에 가까움.
+  information_aware_masking: true
+  masking_temperature: 0.5
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048
+
+train:
+  dataset_path: "SemiMAE:h5_path=<FILL_IN>/train_images.h5"
+  output_dir: "./output_dino_em_v2"
+
+  # ── 배치 크기 ─────────────────────────────────────────────────────────
+  # 4 GPU × 128 = global batch 512
+  batch_size_per_gpu: 128
+  num_workers: 10
+  seed: 0
+
+  # ── OFFICIAL_EPOCH_LENGTH ──────────────────────────────────────────────
+  # LR/WD/momentum 스케줄 계산에만 사용.
+  # 데이터 300K / batch 512 ≈ 586 step = 실제 1 epoch
+  # epochs=100 × OFFICIAL_EPOCH_LENGTH=625 = 총 62,500 step
+  # = 데이터 약 107회 반복
+  #
+  # v1(10만장): 125,000 step / 160회 반복
+  # v2(30만장):  62,500 step / 107회 반복
+  # 데이터 3배이므로 반복 횟수를 줄여도 총 학습량(이미지 노출 수)은
+  # 300K × 107 ≈ 32M > 100K × 160 = 16M — 오히려 2배 증가
+  OFFICIAL_EPOCH_LENGTH: 625
+
+  saveckp_freq: 10
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_large
+  patch_size: 16
+  pretrained_weights: ''
+
+  # ── drop_path_rate: 0.1 → 0.15 ──────────────────────────────────────
+  # 데이터 3배 증가 → 과적합 위험은 줄지만,
+  # EM foundation model은 다양한 downstream task에 써야 하므로
+  # 약간의 regularization 강화로 일반화 성능 확보
+  drop_path_rate: 0.15
+
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.994
+  # ── final_momentum_teacher ────────────────────────────────────────────
+  # v2: 총 step이 v1 대비 절반이지만, 데이터 다양성이 3배
+  # → teacher가 stale해질 위험은 줄어듦. 0.998 유지.
+  # 데이터 다양성↑ → EMA가 더 풍부한 평균을 축적
+  final_momentum_teacher: 0.998
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 15  # warmup 연장 (v1: 10)
+
+optim:
+  epochs: 100
+  optimizer: adamw
+  weight_decay: 0.04
+  # ── weight_decay_end: 0.1 → 0.12 ────────────────────────────────────
+  # 학습 후반에 regularization 소폭 강화
+  # pretrained feature에서 멀어진 후반부에서 과적합 방지
+  weight_decay_end: 0.12
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 1
+  scaling_rule: sqrt_wrt_1024
+
+  # ── layerwise_decay: 0.9 → 0.93 ─────────────────────────────────────
+  # v1(0.9): layer 24 기준 하위 레이어 LR ≈ peak × 0.9^24 ≈ 8% 수준
+  # v2(0.93): layer 24 기준 하위 레이어 LR ≈ peak × 0.93^24 ≈ 17% 수준
+  #
+  # 의도: 하위 레이어에도 EM 도메인 적응을 더 허용하되,
+  #        여전히 상위 레이어 대비 느리게 업데이트하여
+  #        pretrained attention 구조의 점진적 전이를 유도
+  layerwise_decay: 0.93
+
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 224
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  # local crop 하한 0.05 → 0.10: 너무 작은 crop은 EM에서 균일 배경만 잡힘
+  # 하한을 올려 edge가 포함될 확률↑ → iBOT patch-level 학습 품질 향상
+  local_crops_scale:
+    - 0.10
+    - 0.32
+  local_crops_number: 6
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  # ── CLAHE (Contrast Limited Adaptive Histogram Equalization) ──────────
+  # EM 흑백 이미지의 로컬 대비 강화 → 패치 간 차이 증폭 → iBOT 학습 품질↑
+  # ablation 시 false로 설정하여 효과 비교 가능
+  clahe: true
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  # 62,500 total step / 5 ≈ 12,500 step 간격
+  period: 3125
+  max_to_keep: 5
+  keep_every: 99999999999999
+
+schedules:
+  weight_decay:
+    start: 0.04
+    peak: 0.04
+    end: 0.12               # optim.weight_decay_end 와 일치
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.04
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 15        # teacher.warmup_teacher_temp_epochs 와 일치
+  lr:
+    start: 0
+    # ── LR peak: 0.0002 → 0.0003 ──────────────────────────────────────
+    # 데이터 3배 → 더 강하게 학습 가능
+    # sqrt_wrt_1024 scaling 후 실제 적용 LR:
+    #   4 × sqrt(128 × 4 / 1024) × 0.0003 ≈ 0.000849 (4GPU, 128/GPU)
+    #
+    # v1: 4 × sqrt(32×4/1024) × 0.0002 ≈ 0.000283
+    # v2: 약 3배 증가 — 데이터 증가량에 비례
+    peak: 0.0003
+    end: 1.0e-06
+    # ── warmup: 10 → 15 epoch ──────────────────────────────────────────
+    # 데이터 많아진 만큼 warmup을 넉넉히 줘서
+    # pretrained attention 구조가 급격히 깨지지 않도록 보호
+    # 15 epoch = 전체의 15% (from-scratch 수준)
+    warmup_epochs: 15
+    freeze_last_layer_epochs: 1
+    cosine_epochs: 85        # warmup(15) + cosine(85) = 100 총 epoch
+  momentum:
+    start: 0.994
+    peak: 0.994
+    end: 0.998
+    warmup_epochs: 0

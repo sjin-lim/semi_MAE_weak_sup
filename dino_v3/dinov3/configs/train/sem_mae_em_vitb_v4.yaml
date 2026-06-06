@@ -1,0 +1,207 @@
+# ============================================================
+# semi_MAE — 전자현미경(TEM/SEM) 이미지 DINOv3 학습 설정 (v4 / ViT-B)
+#
+# v3 대비 변경 사항:
+#   - 데이터 163,594장 (라벨/저배율 제거 + dedup 후 최종)
+#   - batch_size 96 → 128/GPU (H200 VRAM 여유, global batch 512)
+#   - OFFICIAL_EPOCH_LENGTH 300 → 320 (163K / 512 ≈ 320)
+#   - checkpointing period 3000 → 3200 (64K steps / 20)
+#   - LR scaling 업데이트: sqrt(128×4/1024) × 0.0002 ≈ 0.000566
+#   - ibot head_n_prototypes 16384 → 32768 (patch 다양성 대비 부족 → dino와 동일)
+#   - local_crops_number 6 → 8 (H200 VRAM 여유, 공식 config 기준)
+#
+# 서버 사양:
+#   H200 × 4 (144GB VRAM), 서버 RAM 180GB
+#   WebDataset 320 shards, shuffle buffer 8000, prefetch_factor 2
+#
+# 총 학습량:
+#   200 epochs × 320 steps = 64,000 total steps
+#   64,000 × 512 / 163,594 ≈ 200회 반복
+#   총 이미지 노출: 163,594 × 200 ≈ 32.7M
+#
+# 실행:
+#   cd dino_v3
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_vitb_v4.yaml \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       train.output_dir=/path/to/output
+#
+# dataset_path 형식:
+#   WebDataset:path=/path/to/shards:min_std=5.0
+#   SemiMAE:h5_path=/path/to/file.h5
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  # 163K 데이터: 32768 prototypes ≈ dataset의 20% → over-complete
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  # ViT-B embed_dim=768
+  head_hidden_dim: 1024
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.3
+  mask_random_circular_shift: false
+  information_aware_masking: true
+  masking_temperature: 0.5
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  # 패치 다양성: 163K × 784 patches ≈ 1.28억 → 32768로 dino와 동일하게
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./output_dino_em_vitb_v4"
+
+  # ── 배치 크기 ─────────────────────────────────────────────────────────
+  # 4 GPU × 128 = global batch 512
+  # H200 144GB VRAM → ViT-B + 8 crops 여유
+  batch_size_per_gpu: 128
+  num_workers: 10
+  seed: 0
+
+  # ── OFFICIAL_EPOCH_LENGTH ──────────────────────────────────────────────
+  # 163,594 / 512 ≈ 319.5 → 320 step = 실제 1 epoch
+  # epochs=200 × 320 = 총 64,000 step
+  # = 데이터 약 200회 반복
+  # 총 이미지 노출: 163K × 200 ≈ 32.7M
+  OFFICIAL_EPOCH_LENGTH: 320
+
+  saveckp_freq: 20
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_base
+  patch_size: 16
+  pretrained_weights: ''
+
+  # ── drop_path_rate: 0.2 ──────────────────────────────────────────────
+  # 163K 데이터 → 과적합 위험 → regularization 유지
+  drop_path_rate: 0.2
+
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.994
+  # 163K × 200epoch → 0.998 유지 (teacher stale 방지)
+  final_momentum_teacher: 0.998
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 20
+
+optim:
+  epochs: 200
+  optimizer: adamw
+  weight_decay: 0.04
+  # ── weight_decay_end: 0.15 ──────────────────────────────────────────
+  # 소규모 데이터 → 후반부 regularization 강화
+  weight_decay_end: 0.15
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 1
+  scaling_rule: sqrt_wrt_1024
+
+  # ── layerwise_decay: 0.85 ──────────────────────────────────────────
+  # ViT-B depth=12: 하위 레이어 LR ≈ peak × 0.85^12 ≈ 14%
+  layerwise_decay: 0.85
+
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 224
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.10
+    - 0.32
+  local_crops_number: 8
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: true
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  # 64,000 total step / 20 = 3,200 step 간격
+  period: 3200
+  max_to_keep: 5
+  keep_every: 99999999999999
+
+schedules:
+  weight_decay:
+    start: 0.04
+    peak: 0.04
+    end: 0.15
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.04
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 20
+  lr:
+    start: 0
+    # ── LR peak: 0.0002 ──────────────────────────────────────────────
+    # sqrt_wrt_1024 scaling 후 실제 적용 LR:
+    #   4 × sqrt(128 × 4 / 1024) × 0.0002 ≈ 0.000566 (4GPU, 128/GPU)
+    peak: 0.0002
+    end: 1.0e-06
+    # ── warmup: 20 epoch ──────────────────────────────────────────────
+    # 총 200 epoch의 10%
+    warmup_epochs: 20
+    freeze_last_layer_epochs: 1
+    cosine_epochs: 180      # warmup(20) + cosine(180) = 200 총 epoch
+  momentum:
+    start: 0.994
+    peak: 0.994
+    end: 0.998
+    warmup_epochs: 0

@@ -1,0 +1,215 @@
+# ============================================================
+# semi_MAE — DINOv3 ViT-B High-Res Adaptation v5b (Gram weak)
+#
+# v5b 의도:
+#   v5a (Gram OFF) 와 기존 v5 (Gram 강) 의 절충안.
+#   Gram anchoring 을 약하게 적용 (weight 0.3, 1/5 수준).
+#   - 다른 class 분리 / dense feature 안정성 일부 보존
+#   - 1-2 representation 변화 여지 허용
+#
+# v5a 대비 차이:
+#   - gram.use_loss: true
+#   - gram.loss_weight: 0.3 (v5 의 1.5 대비 1/5)
+#   - gram teacher: v4_ibot_ft (CLI 로 ckpt 지정)
+#
+# 실행:
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_vitb_v5b_hires_weak_gram.yaml \
+#       --no-resume \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       train.output_dir=/path/to/output_v5b_hires_weak_gram \
+#       student.resume_from_teacher_chkpt=/path/to/v4_ibot_ft/.../teacher_checkpoint.pth \
+#       gram.ckpt=/path/to/v4_ibot_ft/.../teacher_checkpoint.pth
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  loss_weight: 1.5
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+  mask_random_circular_shift: false
+  information_aware_masking: true
+  masking_temperature: 0.3
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+
+gram:
+  # ── Gram Anchoring 약하게 (weight 0.3) ──────────────────────────────
+  # 1-2 representation 변화 허용하면서 dense feature 일부 안정화
+  use_loss: true
+  compute_stats: false
+  loss_weight: 0.3
+  ema_teacher: false
+  # CLI override: gram.ckpt=/path/to/v4_ibot_ft/.../teacher_checkpoint.pth
+  ckpt: ''
+  it_load_ema_teacher: -1
+  rep_update: false
+  update_frequency: 10000
+  it_first_update: 0
+  max_updates: 0
+  normalized: true
+  img_level: true
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+  loss_weight_schedule:
+    start: 0.1                        # 학습 초기 충격 최소화
+    peak: 0.3
+    end: 0.3
+    warmup_epochs: 2
+    cosine_epochs: 0
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./output_dino_em_vitb_v5b_hires_weak_gram"
+
+  batch_size_per_gpu: 32
+  num_workers: 10
+  seed: 0
+  OFFICIAL_EPOCH_LENGTH: 1280
+
+  saveckp_freq: 2
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_base
+  patch_size: 16
+  pretrained_weights: ''
+  resume_from_teacher_chkpt: ''       # CLI override
+
+  drop_path_rate: 0.2
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.999
+  final_momentum_teacher: 0.9999
+  warmup_teacher_temp: 0.07
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0
+
+optim:
+  epochs: 10
+  optimizer: adamw
+  weight_decay: 0.15
+  weight_decay_end: 0.15
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 0.9
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size:
+    - 512
+    - 768
+  local_crops_size:
+    - 128
+    - 192
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  local_crops_number: 8
+  global_local_crop_pairs_ratios:
+    - 0.5
+    - 0.5
+  # Gram teacher 해상도 (global 의 1.5x) - 논문 권장
+  gram_teacher_crops_size:
+    - 768
+    - 1152
+  gram_teacher_no_distortions: true
+  localcrops_subset_of_globalcrops: false
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: true
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  period: 1600
+  max_to_keep: 5
+  keep_every: 99999999999999
+
+evaluation:
+  eval_period_iterations: 3200
+
+schedules:
+  weight_decay:
+    start: 0.15
+    peak: 0.15
+    end: 0.15
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.07
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 0
+  lr:
+    start: 0
+    peak: 1.25e-05
+    end: 1.0e-06
+    warmup_epochs: 1
+    freeze_last_layer_epochs: 0
+    cosine_epochs: 9
+  momentum:
+    start: 0.999
+    peak: 0.999
+    end: 0.9999
+    warmup_epochs: 0

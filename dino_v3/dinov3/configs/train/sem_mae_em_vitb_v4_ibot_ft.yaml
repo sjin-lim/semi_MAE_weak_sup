@@ -1,0 +1,190 @@
+# ============================================================
+# semi_MAE — DINOv3 ViT-B iBOT 경계면 강화 추가학습 (v4-ft)
+#
+# v4 대비 변경 사항:
+#   - v4 200epoch 체크포인트에서 resume하여 추가 50 epoch 학습
+#   - iBOT mask_ratio 상한 0.3 → 0.5 (패치 복원 난이도 ↑)
+#   - iBOT masking_temperature 0.5 → 0.3 (경계면 고정보 패치 마스킹 빈도 ↑)
+#   - iBOT loss_weight 1.0 → 1.5 (iBOT 비중 강화)
+#   - LR peak 0.0002 → 0.00005 (기존 representation 보존)
+#   - warmup 5 epoch (짧게), cosine 45 epoch
+#   - weight_decay 고정 0.15 (이미 후반부 값 유지)
+#   - teacher momentum 0.998 → 0.9995 (안정적 teacher)
+#
+# 총 학습량:
+#   50 epochs × 320 steps = 16,000 total steps
+#   총 이미지 노출: 163,594 × 50 ≈ 8.2M (추가분)
+#
+# 실행:
+#   cd dino_v3
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_vitb_v4_ibot_ft.yaml \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       train.output_dir=/path/to/output_v4_ibot_ft
+#
+# ⚠️ output_dir을 v4 체크포인트가 있는 디렉토리로 지정하면
+#    자동으로 latest checkpoint에서 resume 됩니다.
+#    또는 별도 디렉토리 + pretrained_weights 경로 지정
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  # ── iBOT 경계면 강화 핵심 변경 ──────────────────────────────────────
+  loss_weight: 1.5                    # 1.0 → 1.5: 패치 복원 loss 비중 ↑
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5                            # 0.3 → 0.5: 더 많은 패치 마스킹 → 복원 난이도 ↑
+  mask_random_circular_shift: false
+  information_aware_masking: true
+  masking_temperature: 0.3            # 0.5 → 0.3: 경계면(고정보) 패치가 마스킹 대상으로 더 자주 선택
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./output_dino_em_vitb_v4_ibot_ft"
+
+  batch_size_per_gpu: 128
+  num_workers: 10
+  seed: 0
+
+  # 동일 데이터: 163,594 / 512 ≈ 320 step/epoch
+  OFFICIAL_EPOCH_LENGTH: 320
+
+  saveckp_freq: 10
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_base
+  patch_size: 16
+  pretrained_weights: ''
+  # ── v4 체크포인트에서 resume ─────────────────────────────────────────
+  # teacher 체크포인트 경로를 지정하면 student+EMA에 로드 (optimizer는 새로 시작)
+  # 실행 시 CLI로 override: student.resume_from_teacher_chkpt=/path/to/checkpoint
+  resume_from_teacher_chkpt: ''
+  drop_path_rate: 0.2
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.998              # 0.994 → 0.998: fine-tuning이므로 높은 값에서 시작
+  final_momentum_teacher: 0.9995       # 0.998 → 0.9995: teacher 안정성 극대화
+  warmup_teacher_temp: 0.07            # 이미 수렴한 상태 → warmup 불필요, 바로 target temp
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0        # 20 → 0: teacher temp warmup 스킵
+
+optim:
+  epochs: 50                           # 200 → 50: 추가 fine-tuning
+  optimizer: adamw
+  weight_decay: 0.15                   # v4 후반부 값 유지
+  weight_decay_end: 0.15               # 변동 없이 고정
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0          # 1 → 0: 이미 학습된 상태
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 0.9                 # 0.85 → 0.9: fine-tuning이므로 하위 레이어도 더 균일하게
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 224
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05                             # 0.10 → 0.05: 더 작은 local crop → 경계면 집중
+    - 0.32
+  local_crops_number: 8
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: true
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  # 16,000 total step / 8 = 2,000 step 간격
+  period: 2000
+  max_to_keep: 5
+  keep_every: 99999999999999
+
+evaluation:
+  # teacher_checkpoint.pth 저장 주기 (default 12500은 16K 학습에서 1회만 저장됨)
+  # 3200 step ≈ 10 epoch마다 teacher eval checkpoint 저장
+  eval_period_iterations: 3200
+
+schedules:
+  weight_decay:
+    start: 0.15
+    peak: 0.15
+    end: 0.15
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.07
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 0
+  lr:
+    start: 0
+    # ── LR peak: 0.00005 ────────────────────────────────────────────
+    # v4의 1/4 수준, 기존 representation 보존하면서 iBOT 강화분만 반영
+    # sqrt_wrt_1024 scaling 후: 4 × sqrt(512/1024) × 0.00005 ≈ 0.000141
+    peak: 0.00005
+    end: 1.0e-06
+    warmup_epochs: 5                   # 20 → 5: 짧은 warmup
+    freeze_last_layer_epochs: 0
+    cosine_epochs: 45                  # warmup(5) + cosine(45) = 50 총 epoch
+  momentum:
+    start: 0.998
+    peak: 0.998
+    end: 0.9995
+    warmup_epochs: 0
