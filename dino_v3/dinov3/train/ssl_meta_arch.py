@@ -437,12 +437,21 @@ class SSLMetaArch(nn.Module):
                 # student_global["patch_pre_head"] shape: [n_global_crops, B, P, D]
                 stu_patches = student_global["patch_pre_head"]  # (n_global, B, P, D)
                 n_g, Bw, P, D = stu_patches.shape
-                stu_patches_flat = stu_patches.reshape(n_g * Bw, P, D)
+                # Q2: weak loss in float32 for numerically-stable exp(T·sim)
+                # (param_dtype 가 bf16 이면 patch features 도 bf16 → exp 정밀도 저하).
+                stu_patches_flat = stu_patches.reshape(n_g * Bw, P, D).float()
 
                 # patch_labels: (n_global * B, P) — collate 에서 같은 ordering 으로 stacking
                 patch_labels = data["patch_labels"].to(stu_patches.device)
                 assert patch_labels.shape[0] == stu_patches_flat.shape[0], (
                     f"patch_labels {patch_labels.shape} vs patches {stu_patches_flat.shape}"
+                )
+                # R1: patch 개수(P) 일치 검증. global_crops_size/patch_size 와
+                # teacher_to_student_resolution_scale 불일치 시 여기서 명확히 실패.
+                assert patch_labels.shape[1] == P, (
+                    f"patch_labels P={patch_labels.shape[1]} vs student patches P={P} — "
+                    f"check global_crops_size / student.patch_size / "
+                    f"teacher_to_student_resolution_scale"
                 )
 
                 # Lambda warmup

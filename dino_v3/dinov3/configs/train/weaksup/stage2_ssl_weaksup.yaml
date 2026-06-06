@@ -99,7 +99,7 @@ weak_sup:
   background_class: 0
   skip_background: true           # bg pair 제외
   min_patches_per_class: 4
-  patch_purity_threshold: 0.0     # 0 = filter off; 0.8 권장 (boundary noise 회피)
+  patch_purity_threshold: 0.8     # boundary patch (purity<0.8)는 ignore → cross-class noise 회피. 0.0=off
   ignore_label: -1
   # ── Monitoring ────────────────────────────────────────────────────
   log_pair_stats: true            # pair_sim_max/mean 등 logging
