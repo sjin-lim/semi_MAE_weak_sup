@@ -158,21 +158,44 @@ def test_T_sharpness_effect():
     assert loss_high_T < loss_low_T, "higher T concentrates force on high-sim only"
 
 
-def test_batch_weak_loss_aggregation():
+def test_batch_weak_loss_excludes_zero_images():
+    # batch_weak_loss averages ONLY images whose per-image loss > 0
+    # (mirrors the `if loss_i.item() > 0` gate in ssl_meta_arch). It is a
+    # simple mean over contributing images, NOT magnitude-weighted.
     torch.manual_seed(8)
     D = 64
     v = torch.randn(D)
-    # image 0: confused pair → nonzero; image 1: random → ~zero
+    # image 0: confused pair → nonzero
+    img0 = torch.cat([v.unsqueeze(0).repeat(10, 1), v.unsqueeze(0).repeat(10, 1)])
+    lbl0 = _make_labels({1: 10, 2: 10})
+    # image 1: single class → per-image loss is exactly 0 → excluded
+    img1 = torch.randn(20, D)
+    lbl1 = torch.ones(20, dtype=torch.long)
+
+    out = batch_weak_loss([img0, img1], [lbl0, lbl1], T=8.0)
+    only0 = per_patch_pairwise_loss(img0, lbl0, T=8.0).item()
+    assert out.item() == pytest.approx(only0, abs=1e-4), (
+        "img1 contributes 0 → must be dropped → batch == img0 loss"
+    )
+
+
+def test_batch_weak_loss_is_plain_mean():
+    # Two contributing images → unweighted mean of their per-image losses.
+    torch.manual_seed(8)
+    D = 64
+    v = torch.randn(D)
     img0 = torch.cat([v.unsqueeze(0).repeat(10, 1), v.unsqueeze(0).repeat(10, 1)])
     lbl0 = _make_labels({1: 10, 2: 10})
     img1 = torch.randn(20, D)
     lbl1 = _make_labels({1: 10, 2: 10})
 
+    l0 = per_patch_pairwise_loss(img0, lbl0, T=8.0).item()
+    l1 = per_patch_pairwise_loss(img1, lbl1, T=8.0).item()
+    contributing = [x for x in (l0, l1) if x > 0]
+    expected = sum(contributing) / len(contributing)
+
     out = batch_weak_loss([img0, img1], [lbl0, lbl1], T=8.0)
-    assert out.item() > 0.0
-    # batch loss averages only contributing images; img0 dominates
-    only0 = per_patch_pairwise_loss(img0, lbl0, T=8.0).item()
-    assert out.item() == pytest.approx(only0, abs=0.05)
+    assert out.item() == pytest.approx(expected, abs=1e-5)
 
 
 def test_batch_weak_loss_empty():
