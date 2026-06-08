@@ -174,12 +174,15 @@ crops:
   instance_norm: true
   clahe: false
   intensity_aug:
+    # 밝기 aug 최소화 (docs/ANALYSIS_grayscale_separation.md §5,6):
+    # gamma/CLAHE = K1(절대레벨 invariance 강제) 주범 → off.
+    # disk_blur = K3(경계 흐림) 악화 → 약화. poisson(노이즈)·기하·masking 은 유지(SSL 핵심).
     clahe_p: 0.0
-    gamma_p: 0.5
+    gamma_p: 0.0
     poisson_p: 0.3
-    disk_blur_p_global1: 0.3
-    disk_blur_p_global2: 0.05
-    disk_blur_p_local: 0.2
+    disk_blur_p_global1: 0.1
+    disk_blur_p_global2: 0.0
+    disk_blur_p_local: 0.1
   rgb_mean:
     - 0.485
     - 0.456
