@@ -191,6 +191,52 @@ $$
 → **semi-sup = SSL이 못 만드는 material prior 비트를, 표현을 안 망치고 가장 label-efficient하게
 주입.** full은 과하고(파괴), pure SSL은 모자라다(축 부재).
 
+### 7.4 현재 구상한 weak loss 설계 (per-patch pair-wise normalized exponential)
+
+전체 손실 — SSL은 모든 batch, weak는 **labeled image에만**:
+
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{DINO}} + \mathcal{L}_{\text{iBOT}} + \lambda_K \mathcal{L}_{\text{KoLeo}}
+\;+\; \underbrace{\lambda_W\,\mathcal{L}_{\text{weak}}}_{\text{labeled only}}
+$$
+
+이미지 내 **non-background class pair** 집합 $P$ 에 대해, class $a,b$ 의 L2-정규화 patch feature
+사이 cosine $S_{ij}=\langle \hat f^a_i, \hat f^b_j\rangle$ 의 **normalized exponential push**:
+
+$$
+\ell(a,b) = \frac{1}{N_a N_b}\sum_{i=1}^{N_a}\sum_{j=1}^{N_b}
+\frac{e^{T\,S_{ij}} - 1}{e^{T} - 1},
+\qquad
+\mathcal{L}_{\text{weak}} = \frac{1}{|P|}\sum_{(a,b)\in P} \ell(a,b)
+\;\in[0,1]
+$$
+
+**설계 결정과 — 본 분석(M1 masking)과의 연결**:
+
+| 결정 | 이유 | 분석 연결 |
+|---|---|---|
+| **per-patch** (centroid X) | centroid는 outlier 몇 개로 이동 → gaming | 반사가 class 내부 feature를 흩뜨려도(§3) centroid보다 robust |
+| **pair-wise push only** (pull 없음) | SSL prototype·반사 처리 보존, "어디 있어라" 강제 X | 표현 전체 안 건드리고 **물질 축(누락 비트)만** 주입(§7.1) |
+| **bg(class 0) 제외** | background 정의가 dataset마다 다름 | pair 의미 없음 |
+| **normalized exp, bounded[0,1]** | gradient 발산 방지, $\lambda_W$ 조정 가능 | — |
+| **self-curriculum** ($S$↓ → 손실 자동 감소) | threshold 불필요 | 분리되면 자동 약화 |
+| **backbone patch feature(pre-head)** 적용 | prototype 직접 간섭 X, Sinkhorn balance 유지 | head 전 단계라 표현 최소 침습 |
+| **class head 없음** | dataset마다 class 수 가변 | 고정 head 불가 |
+| **purity threshold 0.8** | 경계 patch(혼합)는 ignore | 흐린 경계(M3) 잡음 차단 |
+
+**하이퍼파라미터**: $T=8$ (half-max sim $\approx0.91$ — 위험 영역만 강한 force), $\lambda_W=20$
+(bounded loss라 큰 값 OK), warmup으로 $0\to\lambda_W$ 점증. min_patches_per_class=4 gating.
+
+**§6(wave-aug)와의 상호작용 (중요)**: weak loss는 per-patch라, 파장이 패치 크기면 반사가
+class 내부 patch feature를 출렁이게 해 $S_{ij}$ 에 잡음을 줌 → push가 지저분. 따라서
+**wave-aug로 반사를 먼저 걷어내면 per-patch 신호가 정제되어 weak push가 물질 신호 위에서
+작동**(enabler). 즉 §6 wave-aug ⊕ §7.4 weak push 가 분업: 전자가 within-region 반사를 죽이고,
+후자가 between-region 물질을 민다.
+
+(구현: [losses.py](../dino_v3/dinov3/train/weaksup/losses.py) `per_patch_pairwise_loss` /
+`batch_weak_loss`, 통합: `ssl_meta_arch.py` forward_backward weak 분기. 설계 상세:
+[HANDOFF_CONTEXT.md](../HANDOFF_CONTEXT.md) §4.)
+
 ---
 
 ## 8. 검증 제안
