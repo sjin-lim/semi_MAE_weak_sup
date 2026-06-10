@@ -99,6 +99,7 @@ weak_sup:
   background_class: 0
   skip_background: true           # bg pair 제외
   min_patches_per_class: 4
+  min_nonbg_classes: 2            # non-bg class 2개 미만 image 제외 (pair 없음 → labeled batch 낭비 방지)
   patch_purity_threshold: 0.8     # boundary patch (purity<0.8)는 ignore → cross-class noise 회피. 0.0=off
   ignore_label: -1
   # ── Monitoring ────────────────────────────────────────────────────

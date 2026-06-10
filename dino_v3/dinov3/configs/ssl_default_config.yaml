@@ -200,6 +200,7 @@ weak_sup:
   background_class: 0
   skip_background: true
   min_patches_per_class: 4
+  min_nonbg_classes: 0             # >=N non-bg class 없는 image 는 dataset 에서 제외 (0=필터끔). pair 만들려면 2 권장
   patch_purity_threshold: 0.0      # 0 = filter off; 0.8 권장 (boundary noise 회피)
   ignore_label: -1
   log_pair_stats: false            # logging pair_sim_max/mean 등

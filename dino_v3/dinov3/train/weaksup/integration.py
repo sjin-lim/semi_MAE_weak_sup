@@ -116,7 +116,10 @@ def build_labeled_loader_from_cfg(cfg, mask_generator, dtype, n_tokens, local_ba
     if not cfg.weak_sup.labeled_root:
         raise ValueError("cfg.weak_sup.labeled_root must be set when weak_sup.enabled=True")
 
-    base_ds = LabeledEMDataset(cfg.weak_sup.labeled_root)
+    base_ds = LabeledEMDataset(
+        cfg.weak_sup.labeled_root,
+        min_nonbg_classes=int(getattr(cfg.weak_sup, "min_nonbg_classes", 0)),
+    )
 
     aug = LabeledImageAugmentation(
         global_crops_size=(
