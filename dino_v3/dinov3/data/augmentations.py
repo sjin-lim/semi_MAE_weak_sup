@@ -132,6 +132,123 @@ class FusedEMIntensity:
         return f"FusedEMIntensity({', '.join(parts)})"
 
 
+# ============================================================
+# Wave (ripple) artifact augmentation — 반사 invariance 용
+#
+# EM 금속 분포 간섭으로 생기는 파동(ripple) 밝기 artifact 를 모사.
+# student view 에만 적용 → DINO/iBOT consistency 가 "wave=noise" 를 학습.
+# 배경/수식: docs/ANALYSIS_grayscale_separation.md §6, docs/WAVE_AUG_METHOD.md
+# 측정 도구: notebooks/wave_artifact_analysis.ipynb (band/amp 추정)
+#
+# ⚠️ STAGED: 아래 컴포넌트는 정의만 해 둠. DataAugmentationDINO 에는 아직 미연결
+#    (band/amp 확정 후 연결). 연결법은 WaveModulation docstring 참조.
+# ============================================================
+
+def make_wave_field(size, k_lo, k_hi, rng, direction=None, dir_width=30.0):
+    """band-pass noise ripple field (저해상도 생성 + 업샘플 → 학습용 ~10x 빠름).
+
+    저해상도 hs 에서 생성: small-grid 주파수 = k*(S/hs) 가 Nyquist(0.5) 아래(~0.4)에
+    들도록 hs >= k_hi*S/0.4. wave 는 저주파라 정보 손실 없음.
+
+    Args:
+        size:   정사각 한 변 길이 S (crop 크기).
+        k_lo, k_hi: ripple band (cycles/pixel).
+        rng:    np.random 모듈 또는 Generator (standard_normal 보유).
+    Returns:
+        (S, S) float32, zero-mean, unit-std → 적용 시 amp = 상대 ripple std.
+    """
+    S = int(size)
+    hs = int(np.clip(round(S * k_hi / 0.4), 32, S)) if k_hi > 0 else S
+    scl = S / hs
+    fy = np.fft.fftfreq(hs)[:, None]
+    fx = np.fft.rfftfreq(hs)[None, :]
+    K = np.sqrt(fy ** 2 + fx ** 2)
+    mask = (K >= k_lo * scl) & (K <= k_hi * scl)
+    if direction is not None:
+        ang = (np.degrees(np.arctan2(fy * np.ones_like(fx), fx * np.ones_like(fy))) % 180)
+        d = np.minimum(np.abs(ang - direction), 180 - np.abs(ang - direction))
+        mask = mask & (d <= dir_width)
+    f = np.fft.irfft2(np.fft.rfft2(rng.standard_normal((hs, hs))) * mask, s=(hs, hs))
+    f -= f.mean()
+    s = f.std()
+    if s > 0:
+        f /= s                       # unit std
+    f = np.clip(f, -4.0, 4.0)
+    if hs != S:
+        f = cv2.resize(f.astype(np.float32), (S, S), interpolation=cv2.INTER_LINEAR)
+        f -= f.mean()                # resize 후 평균 재보정
+    return f.astype(np.float32)
+
+
+class WaveModulation:
+    """EM 반사(ripple) artifact 모사 — mean-preserving 곱셈 augmentation.
+
+        I' = I * (1 + amp * w),   w = band-pass noise field (zero-mean, unit-std)
+
+    mean 보존이라 전체적으로 어두워/밝아지지 않음(ripple). PIL(uint8) → PIL(uint8).
+    **FusedEMIntensity 뒤, normalize 앞**에 둘 것 (normalize 후엔 곱셈 무의미).
+
+    student view 에 적용 → teacher(clean anchor, teacher_no_color_jitter=True) 또는
+    독립 wave 가 걸린 다른 global crop 과의 cross-view matching 이 wave-invariance 를
+    학습 ("이 빛 변화는 noise"). docs/ANALYSIS_grayscale_separation.md §6/M1.
+
+    Args:
+        k_lo, k_hi: ripple band (cycles/pixel). notebook 으로 측정.
+        amp:        상대 ripple std (notebook §4b real_rel_std). amp_jitter 시 상한.
+        direction:  방향성(deg) 또는 None(등방성). dir_width: ± 폭(deg).
+        p:          적용 확률 (1-p 는 원본 → 있는/없는 이미지 자연 혼합).
+        amp_jitter: True 면 amp 를 [0, amp] 랜덤.
+        mode:       "mult"(mean 보존) | "log"(homomorphic).
+        spatial_envelope_p: 이 확률로 가우시안 envelope → 국소(물질 내부) wave.
+
+    연결 예 (DataAugmentationDINO.__init__, band/amp 확정 후):
+        wave = WaveModulation(k_lo=K_LO, k_hi=K_HI, amp=AMP, direction=DIR)
+        self.global_transfo1 = v2.Compose([resize_global, global_transfo1, wave, self.normalize])
+        self.global_transfo2 = v2.Compose([resize_global, global_transfo2, wave, self.normalize])
+        # teacher_no_color_jitter=True 권장(teacher=clean anchor). local 적용은 선택.
+    """
+
+    def __init__(self, k_lo, k_hi, amp=0.05, direction=None, dir_width=30.0,
+                 p=0.5, amp_jitter=True, mode="mult", spatial_envelope_p=0.0):
+        self.k_lo = float(k_lo)
+        self.k_hi = float(k_hi)
+        self.amp = float(amp)
+        self.direction = direction
+        self.dir_width = float(dir_width)
+        self.p = float(p)
+        self.amp_jitter = bool(amp_jitter)
+        self.mode = mode
+        self.spatial_envelope_p = float(spatial_envelope_p)
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        # 글로벌 np.random 사용 (DataLoader worker 별 seed 가 적용됨 — FusedEMIntensity 와 동일 규약)
+        if np.random.random() > self.p:
+            return img
+        arr = np.asarray(img)
+        H, W = arr.shape[0], arr.shape[1]
+        w = make_wave_field(max(H, W), self.k_lo, self.k_hi, np.random,
+                            self.direction, self.dir_width)[:H, :W]
+        if self.spatial_envelope_p > 0 and np.random.random() < self.spatial_envelope_p:
+            yy, xx = np.mgrid[0:H, 0:W]
+            cy, cx = np.random.uniform(0.2, 0.8, 2) * np.array([H, W])
+            sig = np.random.uniform(0.15, 0.35) * max(H, W)
+            w = (w * np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sig ** 2)))).astype(np.float32)
+        a = np.random.uniform(0, self.amp) if self.amp_jitter else self.amp
+        if arr.ndim == 3:
+            w = w[..., None]
+        f = arr.astype(np.float32)
+        if self.mode == "mult":
+            f *= (1.0 + a * w)
+        else:  # log (homomorphic): I*exp(a*w), saturation 비대칭 완화
+            f = np.exp(np.log(f + 1.0) + a * w) - 1.0
+        np.clip(f, 0, 255, out=f)
+        return Image.fromarray(f.astype(np.uint8), mode=img.mode)
+
+    def __repr__(self):
+        return (f"WaveModulation(band=[{self.k_lo},{self.k_hi}], amp={self.amp}, "
+                f"p={self.p}, mode={self.mode}, dir={self.direction})")
+
+
 logger = logging.getLogger("dinov3")
 
 # ============================================================
