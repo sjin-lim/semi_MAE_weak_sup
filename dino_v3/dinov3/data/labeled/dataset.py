@@ -53,10 +53,15 @@ class LabeledEMDataset(Dataset):
         if not self.root.is_dir():
             raise FileNotFoundError(f"labeled_root not found: {self.root}")
 
-        # Discover datasets (subdirs that contain images/ and masks/)
-        candidates = sorted([p for p in self.root.iterdir() if p.is_dir()])
-        if datasets is not None:
-            candidates = [p for p in candidates if p.name in set(datasets)]
+        # 두 layout 모두 지원:
+        #   (A) flat:          labeled_root/images + masks
+        #   (B) multi-dataset: labeled_root/<ds>/images + masks
+        if (self.root / "images").is_dir() and (self.root / "masks").is_dir():
+            candidates = [self.root]                      # flat layout
+        else:
+            candidates = sorted([p for p in self.root.iterdir() if p.is_dir()])
+            if datasets is not None:
+                candidates = [p for p in candidates if p.name in set(datasets)]
 
         self.entries = []
         self.dataset_meta = {}

@@ -213,8 +213,10 @@ schedules:
     warmup_epochs: 0
   lr:
     start: 0
-    # Stage 2: 작은 LR (representation 변화 적게, weak sup signal 만 주입)
-    peak: 0.00005
+    # Stage 2 (교정 run): peak 1e-4. baked-in 반사-지배를 풀고 weak sup 물질 축을
+    # 주입하려면 preservation LR(5e-5)로는 약함. layerwise_decay 0.9 가 깊은 층 더 움직임.
+    # (sim[1,2] 정체 시 2e-4 로 상향 / 발산 시 5e-5 로 하향 — HANDOFF §11)
+    peak: 0.0001
     end: 1.0e-06
     warmup_epochs: 3
     freeze_last_layer_epochs: 0
