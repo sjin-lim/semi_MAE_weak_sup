@@ -92,8 +92,10 @@ weak_sup:
   num_workers_labeled: 4
   batch_size_labeled: 16          # per-GPU labeled batch
   # ── Loss formulation ──────────────────────────────────────────────
-  T: 8.0                          # exponential sharpness (half-max sim ≈ 0.91)
-  lambda_W: 20.0                  # loss weight (bounded loss라 큰 값 OK)
+  # T=5: confused pair 가 실측 ~0.75 에 있어 T=8(half-max 0.91)에선 거의 free →
+  #      half-max 0.86 으로 낮춰 0.75 에 force 를 실음. (정체 시 4 까지 ↓ / over-sep 시 ↑)
+  T: 5.0                          # exponential sharpness (half-max sim ≈ 0.86)
+  lambda_W: 15.0                  # 20→15 (T 낮춰 weak_loss 커지니 전역 교란 보정)
   warmup_steps: 1000              # 0 → lambda_W 점진 증가
   # ── Patch handling ────────────────────────────────────────────────
   background_class: 0
@@ -214,10 +216,10 @@ schedules:
     warmup_epochs: 0
   lr:
     start: 0
-    # Stage 2 (교정 run): peak 1e-4. baked-in 반사-지배를 풀고 weak sup 물질 축을
-    # 주입하려면 preservation LR(5e-5)로는 약함. layerwise_decay 0.9 가 깊은 층 더 움직임.
-    # (sim[1,2] 정체 시 2e-4 로 상향 / 발산 시 5e-5 로 하향 — HANDOFF §11)
-    peak: 0.0001
+    # Stage 2 peak 5e-5: 1e-4 는 iBOT loss 악화(3.0→3.8)의 주범 → 되돌림. weak push 의
+    # 실효는 LR 이 아니라 T(force 위치)로 확보. layerwise_decay 0.9 가 깊은 층 더 움직임.
+    # (iBOT 안정 + pair_sim 더 떨어지면 성공. 정체면 wave-aug/재시작 검토 — HANDOFF §11)
+    peak: 0.00005
     end: 1.0e-06
     warmup_epochs: 3
     freeze_last_layer_epochs: 0
