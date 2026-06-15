@@ -136,6 +136,7 @@ def build_labeled_loader_from_cfg(cfg, mask_generator, dtype, n_tokens, local_ba
         horizontal_flips=cfg.crops.horizontal_flips,
         clahe=getattr(cfg.crops, "clahe", False),
         intensity_aug_config=getattr(cfg.crops, "intensity_aug", None),
+        wave_aug_config=getattr(cfg.crops, "wave_aug", None),
         instance_norm=getattr(cfg.crops, "instance_norm", False),
         mean=tuple(cfg.crops.rgb_mean),
         std=tuple(cfg.crops.rgb_std),

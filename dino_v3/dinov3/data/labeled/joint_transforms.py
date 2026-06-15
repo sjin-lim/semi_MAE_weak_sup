@@ -20,8 +20,8 @@ try:
 except Exception:
     PerImageNormalize = None
 
-# Reuse the EM intensity augmentation from existing augmentations module
-from dinov3.data.augmentations import FusedEMIntensity
+# Reuse the EM intensity + wave augmentation from existing augmentations module
+from dinov3.data.augmentations import FusedEMIntensity, build_wave_modulation
 
 logger = logging.getLogger("dinov3")
 
@@ -98,6 +98,7 @@ class LabeledImageAugmentation:
         vertical_flips: bool = True,
         clahe: bool = False,
         intensity_aug_config: dict = None,
+        wave_aug_config: dict = None,
         instance_norm: bool = True,
         mean: tuple = IMAGENET_DEFAULT_MEAN,
         std: tuple = IMAGENET_DEFAULT_STD,
@@ -150,6 +151,13 @@ class LabeledImageAugmentation:
             disk_blur_p=_ia_defaults["disk_blur_p_local"],
         )
 
+        # Wave (ripple/반사) augmentation — global student view only.
+        # 두 global crop 에 독립 wave realization → cross-view consistency 가
+        # wave-invariance 학습 (clean teacher anchor 없이도 서로 다른 wave 라 유효).
+        # 곱셈 + mean 보존 + 기하 불변 → mask 정합 영향 없음.
+        self.wave_fns = [build_wave_modulation(wave_aug_config),
+                         build_wave_modulation(wave_aug_config)]
+
         # Normalization
         if instance_norm and PerImageNormalize is not None:
             self.normalize = v2.Compose([
@@ -174,6 +182,8 @@ class LabeledImageAugmentation:
         for k in range(2):
             geo_img, geo_mask = self.joint_global(image, mask)
             int_img = intensity_fns[k](geo_img)
+            if self.wave_fns[k] is not None:
+                int_img = self.wave_fns[k](int_img)
             normalized = self.normalize(int_img)
             global_imgs.append(normalized)
             global_masks.append(geo_mask)

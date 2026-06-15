@@ -249,6 +249,31 @@ class WaveModulation:
                 f"p={self.p}, mode={self.mode}, dir={self.direction})")
 
 
+def build_wave_modulation(wave_aug_config) -> "WaveModulation | None":
+    """config dict → WaveModulation instance (또는 None).
+
+    wave_aug_config 가 None 이거나 enabled=False 면 None 반환 (= wave off).
+    누락 key 는 보수적 default 로 채움. 각 호출마다 새 인스턴스를 생성
+    (WaveModulation 은 stateless 라 공유해도 안전하지만 관례상 분리).
+    """
+    if wave_aug_config is None:
+        return None
+    cfg = dict(wave_aug_config)
+    if not cfg.get("enabled", False):
+        return None
+    return WaveModulation(
+        k_lo=cfg.get("k_lo", 0.001),
+        k_hi=cfg.get("k_hi", 0.0031),
+        amp=cfg.get("amp", 0.12),
+        direction=cfg.get("direction", None),
+        dir_width=cfg.get("dir_width", 30.0),
+        p=cfg.get("p", 0.5),
+        amp_jitter=cfg.get("amp_jitter", True),
+        mode=cfg.get("mode", "mult"),
+        spatial_envelope_p=cfg.get("spatial_envelope_p", 0.0),
+    )
+
+
 logger = logging.getLogger("dinov3")
 
 # ============================================================
@@ -294,6 +319,7 @@ class DataAugmentationDINO(object):
         instance_norm=False,
         clahe=False,
         intensity_aug_config=None,
+        wave_aug_config=None,
     ):
         self.global_crops_scale = global_crops_scale
         self.local_crops_scale = local_crops_scale
@@ -456,8 +482,24 @@ class DataAugmentationDINO(object):
                 ]
             )
 
-        self.global_transfo1 = v2.Compose([resize_global, global_transfo1, self.normalize])
-        self.global_transfo2 = v2.Compose([resize_global, global_transfo2, self.normalize])
+        # ── Wave (ripple/반사) augmentation — student view only ────────────
+        # FusedEMIntensity 뒤, normalize 앞에 삽입 (uint8 PIL 에 곱셈).
+        # teacher 는 normalize(im*_base) 라 wave 가 안 걸린 clean anchor →
+        # cross-view consistency 가 "ripple 밝기 = noise" 를 학습 (반사 invariance).
+        wave_g1 = build_wave_modulation(wave_aug_config)
+        wave_g2 = build_wave_modulation(wave_aug_config)
+        logger.info(f"wave_aug: {wave_g1 if wave_g1 is not None else 'OFF'}")
+
+        g1_steps = [resize_global, global_transfo1]
+        g2_steps = [resize_global, global_transfo2]
+        if wave_g1 is not None:
+            g1_steps.append(wave_g1)
+            g2_steps.append(wave_g2)
+        g1_steps.append(self.normalize)
+        g2_steps.append(self.normalize)
+
+        self.global_transfo1 = v2.Compose(g1_steps)
+        self.global_transfo2 = v2.Compose(g2_steps)
         self.local_transfo = v2.Compose([local_transfo, self.normalize])
 
     def __call__(self, image):

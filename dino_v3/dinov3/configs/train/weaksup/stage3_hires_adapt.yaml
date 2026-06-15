@@ -89,8 +89,9 @@ weak_sup:
   labeled_ratio: 0.15             # 0.25 → 0.15 (high-res 가 main goal)
   num_workers_labeled: 4
   batch_size_labeled: 4
-  T: 8.0
-  lambda_W: 5.0                   # 20 → 5 (light preservation, not main learning)
+  margin: 0.85                    # Stage 2 와 동일 hinge anti-merge
+  hinge_power: 2.0
+  lambda_W: 10.0                  # light preservation (Stage2 30 → 10, high-res 가 main)
   warmup_steps: 200
   background_class: 0
   skip_background: true
@@ -193,6 +194,18 @@ crops:
     disk_blur_p_global1: 0.1
     disk_blur_p_global2: 0.0
     disk_blur_p_local: 0.1
+  # Wave (반사/ripple) augmentation — Stage 2 와 동일 (반사 invariance 유지)
+  wave_aug:
+    enabled: true
+    k_lo: 0.001
+    k_hi: 0.0031
+    amp: 0.12
+    direction: null
+    dir_width: 30.0
+    p: 0.5
+    amp_jitter: true
+    mode: mult
+    spatial_envelope_p: 0.3
   rgb_mean:
     - 0.485
     - 0.456

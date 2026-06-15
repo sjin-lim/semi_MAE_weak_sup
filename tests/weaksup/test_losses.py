@@ -1,14 +1,10 @@
 # Unit tests for per_patch_pairwise_loss / batch_weak_loss / compute_pair_sim_stats.
 #
-# Covers the core claims from HANDOFF_CONTEXT.md §4.3 / §6:
-#   - random (dissimilar) features  → loss ≈ 0.001 (negligible)
-#   - artificially similar features → loss large (0.3+)
-#   - loss bounded in [0, 1]
-#   - background class excluded
-#   - min_patches_per_class gating
-#   - gradient flows to features (push-only direction)
-#   - self-curriculum: monotonically lower sim → lower loss
-import math
+# Loss is HINGE ANTI-MERGE:  ℓ_ij = (relu(sim - margin) / (1-margin))^power
+#   - cross-class sim <= margin   → contributes exactly 0 (이미 구분된 쌍 방치)
+#   - cross-class sim == 1        → contributes 1.0 (fully merged)
+#   - bounded [0, 1], self-curriculum (sim 떨어지면 자동 0)
+#   - background excluded, min_patches gating, gradient flows on >margin pairs
 
 import pytest
 
@@ -27,15 +23,27 @@ def _make_labels(counts):
     return torch.cat(parts)
 
 
+def _two_class_feats(sim, n=10, D=64):
+    """두 class 간 cross cosine 을 정확히 `sim` 으로 만드는 feature/label."""
+    a = torch.zeros(n, D)
+    a[:, 0] = 1.0
+    b = torch.zeros(n, D)
+    b[:, 0] = sim
+    b[:, 1] = (1.0 - sim ** 2) ** 0.5
+    feats = torch.cat([a, b])
+    labels = _make_labels({1: n, 2: n})
+    return feats, labels
+
+
 def test_random_features_negligible_loss():
     torch.manual_seed(0)
     N, D = 100, 768
     feats = torch.randn(N, D)
     labels = _make_labels({0: 30, 1: 35, 2: 35})  # 0 = background
 
-    loss = per_patch_pairwise_loss(feats, labels, T=8.0)
-    # Random high-dim unit vectors → cross-class cosine ~0 → exp(8*~0)-1 ~0
-    assert loss.item() < 0.01, f"expected tiny loss for random features, got {loss.item()}"
+    loss = per_patch_pairwise_loss(feats, labels, margin=0.85)
+    # Random high-dim vectors → cross-class cosine ~0 << margin → hinge 0
+    assert loss.item() < 1e-6, f"expected ~0 loss for random features, got {loss.item()}"
 
 
 def test_similar_features_large_loss():
@@ -44,27 +52,43 @@ def test_similar_features_large_loss():
     base1 = torch.randn(D)
     base2 = base1 + 0.05 * torch.randn(D)  # class 2 ≈ class 1 (confused pair)
     feats = torch.cat([
-        torch.randn(30, D),                          # bg
+        torch.randn(30, D),                              # bg
         base1.unsqueeze(0) + 0.02 * torch.randn(35, D),  # class 1
         base2.unsqueeze(0) + 0.02 * torch.randn(35, D),  # class 2
     ])
     labels = _make_labels({0: 30, 1: 35, 2: 35})
 
-    loss = per_patch_pairwise_loss(feats, labels, T=8.0)
-    assert loss.item() > 0.3, f"expected large loss for confused pair, got {loss.item()}"
+    loss = per_patch_pairwise_loss(feats, labels, margin=0.85)
+    assert loss.item() > 0.3, f"expected large loss for merged pair, got {loss.item()}"
 
 
 def test_loss_bounded_unit_interval():
     torch.manual_seed(1)
     D = 64
-    # Identical features across two classes → max possible sim = 1.0
+    # Identical features across two classes → sim = 1.0 everywhere
     v = torch.randn(D)
     feats = torch.cat([v.unsqueeze(0).repeat(20, 1), v.unsqueeze(0).repeat(20, 1)])
     labels = _make_labels({1: 20, 2: 20})
-    loss = per_patch_pairwise_loss(feats, labels, T=8.0)
+    loss = per_patch_pairwise_loss(feats, labels, margin=0.85)
     assert 0.0 <= loss.item() <= 1.0 + 1e-5, f"loss out of [0,1]: {loss.item()}"
-    # sim == 1 everywhere → normalized exp == (exp(T)-1)/(exp(T)-1) == 1
+    # sim==1 → (relu(1-margin)/(1-margin))^2 == 1
     assert loss.item() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_below_margin_zero_force():
+    # 핵심: margin 이하로 이미 구분된 쌍은 force 가 정확히 0.
+    feats, labels = _two_class_feats(sim=0.7, n=10)
+    assert per_patch_pairwise_loss(feats, labels, margin=0.85).item() == 0.0
+    # margin 을 sim 아래로 내리면 다시 force 발생
+    assert per_patch_pairwise_loss(feats, labels, margin=0.6).item() > 0.0
+
+
+def test_margin_higher_means_lower_loss():
+    # 같은 (높은) sim 에서 margin 이 클수록 loss 가 작다.
+    feats, labels = _two_class_feats(sim=0.95, n=10)
+    low_margin = per_patch_pairwise_loss(feats, labels, margin=0.6).item()
+    high_margin = per_patch_pairwise_loss(feats, labels, margin=0.85).item()
+    assert high_margin < low_margin, (low_margin, high_margin)
 
 
 def test_background_excluded():
@@ -74,7 +98,7 @@ def test_background_excluded():
     # bg (class 0) identical to class 1, but bg must be skipped → no pair
     feats = torch.cat([v.unsqueeze(0).repeat(20, 1), v.unsqueeze(0).repeat(20, 1)])
     labels = _make_labels({0: 20, 1: 20})
-    loss = per_patch_pairwise_loss(feats, labels, T=8.0, skip_background=True)
+    loss = per_patch_pairwise_loss(feats, labels, margin=0.85, skip_background=True)
     assert loss.item() == 0.0, "only bg+1 class present → no non-bg pair → zero"
 
 
@@ -84,7 +108,7 @@ def test_min_patches_gating():
     v = torch.randn(D)
     feats = torch.cat([v.unsqueeze(0).repeat(10, 1), v.unsqueeze(0).repeat(2, 1)])
     labels = _make_labels({1: 10, 2: 2})  # class 2 below min_patches=4
-    loss = per_patch_pairwise_loss(feats, labels, T=8.0, min_patches_per_class=4)
+    loss = per_patch_pairwise_loss(feats, labels, margin=0.85, min_patches_per_class=4)
     assert loss.item() == 0.0, "class 2 too small → dropped → single class → zero"
 
 
@@ -105,7 +129,7 @@ def test_ignore_label_dropped():
     ])
     labels = _make_labels({1: 20, 2: 20})
     labels = torch.cat([labels, torch.full((20,), -1, dtype=torch.long)])
-    loss = per_patch_pairwise_loss(feats, labels, T=8.0)
+    loss = per_patch_pairwise_loss(feats, labels, margin=0.85)
     # ignore patches must not create pairs; classes 1 & 2 still do → ~1.0
     assert loss.item() == pytest.approx(1.0, abs=1e-3)
 
@@ -118,16 +142,16 @@ def test_gradient_flows_and_pushes_apart():
         v.unsqueeze(0).repeat(8, 1) + 0.01 * torch.randn(8, D),
         v.unsqueeze(0).repeat(8, 1) + 0.01 * torch.randn(8, D),
     ]).requires_grad_(True)
-    labels = _make_labels({1: 8, 2: 8})
-    loss = per_patch_pairwise_loss(feats, labels, T=8.0)
+    labels = _make_labels({1: 8, 2: 8})  # sim ≈ 1 > margin → force on
+    loss = per_patch_pairwise_loss(feats, labels, margin=0.85)
     loss.backward()
     assert feats.grad is not None
     assert torch.isfinite(feats.grad).all()
-    assert feats.grad.abs().sum() > 0, "push force should produce nonzero gradient"
+    assert feats.grad.abs().sum() > 0, "merged pair should produce nonzero gradient"
 
 
 def test_self_curriculum_monotonic():
-    # As cross-class sim decreases, loss must decrease (self-curriculum claim).
+    # As cross-class sim decreases, loss must be non-increasing (self-curriculum).
     torch.manual_seed(6)
     D = 128
     losses = []
@@ -138,63 +162,47 @@ def test_self_curriculum_monotonic():
             v.unsqueeze(0).repeat(20, 1) + noise * torch.randn(20, D),
         ])
         labels = _make_labels({1: 20, 2: 20})
-        losses.append(per_patch_pairwise_loss(feats, labels, T=8.0).item())
+        losses.append(per_patch_pairwise_loss(feats, labels, margin=0.85).item())
     for a, b in zip(losses, losses[1:]):
         assert a >= b - 1e-4, f"loss should be non-increasing as sim drops: {losses}"
 
 
-def test_T_sharpness_effect():
-    # Higher T → only very-high-sim region penalized → lower loss at moderate sim.
-    torch.manual_seed(7)
-    D = 128
-    v = torch.randn(D)
-    feats = torch.cat([
-        v.unsqueeze(0).repeat(20, 1),
-        v.unsqueeze(0).repeat(20, 1) + 0.6 * torch.randn(20, D),  # moderate sim
-    ])
-    labels = _make_labels({1: 20, 2: 20})
-    loss_low_T = per_patch_pairwise_loss(feats, labels, T=4.0).item()
-    loss_high_T = per_patch_pairwise_loss(feats, labels, T=12.0).item()
-    assert loss_high_T < loss_low_T, "higher T concentrates force on high-sim only"
-
-
 def test_batch_weak_loss_excludes_zero_images():
-    # batch_weak_loss averages ONLY images whose per-image loss > 0
-    # (mirrors the `if loss_i.item() > 0` gate in ssl_meta_arch). It is a
-    # simple mean over contributing images, NOT magnitude-weighted.
+    # batch_weak_loss averages ONLY images whose per-image loss > 0.
     torch.manual_seed(8)
     D = 64
     v = torch.randn(D)
-    # image 0: confused pair → nonzero
+    # image 0: merged pair → nonzero
     img0 = torch.cat([v.unsqueeze(0).repeat(10, 1), v.unsqueeze(0).repeat(10, 1)])
     lbl0 = _make_labels({1: 10, 2: 10})
     # image 1: single class → per-image loss is exactly 0 → excluded
     img1 = torch.randn(20, D)
     lbl1 = torch.ones(20, dtype=torch.long)
 
-    out = batch_weak_loss([img0, img1], [lbl0, lbl1], T=8.0)
-    only0 = per_patch_pairwise_loss(img0, lbl0, T=8.0).item()
+    out = batch_weak_loss([img0, img1], [lbl0, lbl1], margin=0.85)
+    only0 = per_patch_pairwise_loss(img0, lbl0, margin=0.85).item()
     assert out.item() == pytest.approx(only0, abs=1e-4), (
         "img1 contributes 0 → must be dropped → batch == img0 loss"
     )
 
 
 def test_batch_weak_loss_is_plain_mean():
-    # Two contributing images → unweighted mean of their per-image losses.
+    # Two contributing (merged) images → unweighted mean of per-image losses.
     torch.manual_seed(8)
     D = 64
     v = torch.randn(D)
+    w = torch.randn(D)
     img0 = torch.cat([v.unsqueeze(0).repeat(10, 1), v.unsqueeze(0).repeat(10, 1)])
     lbl0 = _make_labels({1: 10, 2: 10})
-    img1 = torch.randn(20, D)
+    img1 = torch.cat([w.unsqueeze(0).repeat(10, 1), w.unsqueeze(0).repeat(10, 1)])
     lbl1 = _make_labels({1: 10, 2: 10})
 
-    l0 = per_patch_pairwise_loss(img0, lbl0, T=8.0).item()
-    l1 = per_patch_pairwise_loss(img1, lbl1, T=8.0).item()
-    contributing = [x for x in (l0, l1) if x > 0]
-    expected = sum(contributing) / len(contributing)
+    l0 = per_patch_pairwise_loss(img0, lbl0, margin=0.85).item()
+    l1 = per_patch_pairwise_loss(img1, lbl1, margin=0.85).item()
+    assert l0 > 0 and l1 > 0
+    expected = (l0 + l1) / 2.0
 
-    out = batch_weak_loss([img0, img1], [lbl0, lbl1], T=8.0)
+    out = batch_weak_loss([img0, img1], [lbl0, lbl1], margin=0.85)
     assert out.item() == pytest.approx(expected, abs=1e-5)
 
 
@@ -213,7 +221,7 @@ def test_compute_pair_sim_stats():
         v.unsqueeze(0).repeat(20, 1),     # class 2 == class 1 centroid
     ])
     labels = _make_labels({0: 20, 1: 20, 2: 20})
-    stats = compute_pair_sim_stats(feats, labels)
+    stats = compute_pair_sim_stats(feats, labels, margin=0.85)
     assert stats["n_pairs"] == 1  # only the 1-2 pair (bg excluded)
     assert stats["pair_sim_max"] == pytest.approx(1.0, abs=1e-3)
-    assert stats["hard_pair_ratio"] == pytest.approx(1.0)
+    assert stats["merged_pair_ratio"] == pytest.approx(1.0)

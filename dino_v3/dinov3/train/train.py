@@ -495,7 +495,9 @@ def do_train(cfg, model, resume=False):
         )
         logger.info(
             f"[weak_sup] Mixed loader active. labeled_ratio={cfg.weak_sup.labeled_ratio}, "
-            f"T={cfg.weak_sup.T}, lambda_W={cfg.weak_sup.lambda_W}"
+            f"margin={getattr(cfg.weak_sup, 'margin', 0.85)}, "
+            f"hinge_power={getattr(cfg.weak_sup, 'hinge_power', 2.0)}, "
+            f"lambda_W={cfg.weak_sup.lambda_W}"
         )
 
     # Metric logging

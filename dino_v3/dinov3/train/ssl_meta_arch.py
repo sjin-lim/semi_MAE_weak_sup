@@ -437,8 +437,8 @@ class SSLMetaArch(nn.Module):
                 # student_global["patch_pre_head"] shape: [n_global_crops, B, P, D]
                 stu_patches = student_global["patch_pre_head"]  # (n_global, B, P, D)
                 n_g, Bw, P, D = stu_patches.shape
-                # Q2: weak loss in float32 for numerically-stable exp(T·sim)
-                # (param_dtype 가 bf16 이면 patch features 도 bf16 → exp 정밀도 저하).
+                # Q2: weak loss in float32 for numerically-stable cosine/hinge
+                # (param_dtype 가 bf16 이면 patch features 도 bf16 → 정밀도 저하).
                 stu_patches_flat = stu_patches.reshape(n_g * Bw, P, D).float()
 
                 # patch_labels: (n_global * B, P) — collate 에서 같은 ordering 으로 stacking
@@ -466,7 +466,8 @@ class SSLMetaArch(nn.Module):
                     labels_i = patch_labels[i]
                     loss_i = per_patch_pairwise_loss(
                         feats_i, labels_i,
-                        T=float(weak_sup_cfg.T),
+                        margin=float(getattr(weak_sup_cfg, "margin", 0.85)),
+                        power=float(getattr(weak_sup_cfg, "hinge_power", 2.0)),
                         background_class=int(weak_sup_cfg.background_class),
                         min_patches_per_class=int(weak_sup_cfg.min_patches_per_class),
                         skip_background=bool(weak_sup_cfg.skip_background),
@@ -477,6 +478,7 @@ class SSLMetaArch(nn.Module):
                     if getattr(weak_sup_cfg, "log_pair_stats", False):
                         stats = compute_pair_sim_stats(
                             feats_i, labels_i,
+                            margin=float(getattr(weak_sup_cfg, "margin", 0.85)),
                             background_class=int(weak_sup_cfg.background_class),
                             min_patches_per_class=int(weak_sup_cfg.min_patches_per_class),
                             skip_background=bool(weak_sup_cfg.skip_background),
@@ -837,6 +839,8 @@ class SSLMetaArch(nn.Module):
         # ablation 용: crops.intensity_aug = {clahe_p, gamma_p, poisson_p,
         #   disk_blur_p_global1, disk_blur_p_global2, disk_blur_p_local}
         intensity_aug_config = getattr(cfg.crops, "intensity_aug", None)
+        # 반사 invariance 용 wave-aug: crops.wave_aug = {enabled, k_lo, k_hi, amp, ...}
+        wave_aug_config = getattr(cfg.crops, "wave_aug", None)
         return DataAugmentationDINO(
             cfg.crops.global_crops_scale,
             cfg.crops.local_crops_scale,
@@ -853,6 +857,7 @@ class SSLMetaArch(nn.Module):
             instance_norm=instance_norm,
             clahe=clahe,
             intensity_aug_config=intensity_aug_config,
+            wave_aug_config=wave_aug_config,
         )
 
     def get_maybe_fused_params_for_submodel(self, m: nn.Module):

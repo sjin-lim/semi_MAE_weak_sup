@@ -8,11 +8,15 @@
 # 출발점:
 #   Stage 1 teacher checkpoint.
 #
-# Weak sup loss 핵심:
-#   - Per-patch pair-wise normalized exponential
+# Weak sup loss 핵심 (HINGE ANTI-MERGE — exp-push 에서 전환):
+#   - Per-patch pair-wise hinge: cross-class sim > margin 인 쌍만 margin 까지 떼어냄
+#   - sim <= margin 는 force 정확히 0 (이미 구분된 쌍 방치 → iBOT 보존, scatter 회피)
 #   - Class 0 (background) 제외
-#   - Self-curriculum (sim 떨어지면 자동 weak)
+#   - Self-curriculum (margin 아래로 내려가면 자동 0)
 #   - Bounded [0, 1]
+#
+# 반사(물질 내 밝기) 대응은 loss(pull) 가 아니라 crops.wave_aug (student-only
+#   consistency) 로 처리 — 정보 비파괴 + per-task 충돌 없음. docs §6.
 #
 # 실행:
 #   python dinov3/train/train.py \
@@ -91,11 +95,15 @@ weak_sup:
   labeled_ratio: 0.25             # 매 step 25% 확률로 labeled batch 사용
   num_workers_labeled: 4
   batch_size_labeled: 16          # per-GPU labeled batch
-  # ── Loss formulation ──────────────────────────────────────────────
-  # T=5: confused pair 가 실측 ~0.75 에 있어 T=8(half-max 0.91)에선 거의 free →
-  #      half-max 0.86 으로 낮춰 0.75 에 force 를 실음. (정체 시 4 까지 ↓ / over-sep 시 ↑)
-  T: 5.0                          # exponential sharpness (half-max sim ≈ 0.86)
-  lambda_W: 15.0                  # 20→15 (T 낮춰 weak_loss 커지니 전역 교란 보정)
+  # ── Loss formulation (HINGE ANTI-MERGE) ───────────────────────────
+  # margin=0.85: cross-class patch sim 이 0.85 초과로 "합쳐진" 쌍만 떼어냄.
+  #   0.85 이하는 이미 구분된 것으로 보고 force=0 (이전 exp-push 는 sim=0.5 에도
+  #   force 0.4 가 남아 iBOT 를 흩뜨림 → 폐기). 타겟 = >0.9 옅은-경계 쌍.
+  margin: 0.85
+  hinge_power: 2.0                # 제곱: margin 근처에서 force 0→부드럽게 (1.0=선형, 급함)
+  # lambda_W: hinge 는 대부분 쌍이 0 이라 weak_loss 평균값이 작음 → exp 때보다 크게 둠.
+  #   weak_loss 가 dino/ibot 대비 너무 작으면(<0.02) ↑, merged_pair_ratio 안 떨어지면 ↑.
+  lambda_W: 30.0
   warmup_steps: 1000              # 0 → lambda_W 점진 증가
   # ── Patch handling ────────────────────────────────────────────────
   background_class: 0
@@ -186,6 +194,22 @@ crops:
     disk_blur_p_global1: 0.1
     disk_blur_p_global2: 0.0
     disk_blur_p_local: 0.1
+  # ── Wave (반사/ripple) augmentation ─────────────────────────────────
+  # 물질 내 밝기 변화(반사) invariance. student global view 에만 적용 →
+  # teacher(clean anchor) 와의 consistency 가 "ripple = noise" 학습.
+  # pull loss 대체 (정보 비파괴·전 데이터 적용·per-task 충돌 없음). docs §6.
+  # band/amp 는 notebooks/wave_artifact_analysis.ipynb 실측 기반.
+  wave_aug:
+    enabled: true
+    k_lo: 0.001                   # ripple band 하한 (cycles/pixel)
+    k_hi: 0.0031                  # 상한 (저주파라 step 경계[고주파]는 보존)
+    amp: 0.12                     # 상대 ripple std (real 0.30 의 ~40%, DC 침범 회피)
+    direction: null               # 등방성 (측정된 방향성 있으면 deg)
+    dir_width: 30.0
+    p: 0.5                        # 있는/없는 이미지 자연 혼합
+    amp_jitter: true              # amp 를 [0, amp] 랜덤
+    mode: mult                    # mean 보존 곱셈
+    spatial_envelope_p: 0.3       # 30% 는 국소(물질 내부) ripple
   rgb_mean:
     - 0.485
     - 0.456
@@ -217,8 +241,8 @@ schedules:
   lr:
     start: 0
     # Stage 2 peak 5e-5: 1e-4 는 iBOT loss 악화(3.0→3.8)의 주범 → 되돌림. weak push 의
-    # 실효는 LR 이 아니라 T(force 위치)로 확보. layerwise_decay 0.9 가 깊은 층 더 움직임.
-    # (iBOT 안정 + pair_sim 더 떨어지면 성공. 정체면 wave-aug/재시작 검토 — HANDOFF §11)
+    # 실효는 LR 이 아니라 margin(force 위치)로 확보. layerwise_decay 0.9 가 깊은 층 더 움직임.
+    # (iBOT 안정 + merged_pair_ratio 0 수렴이면 성공. 정체면 margin↓/lambda↑ — HANDOFF §11)
     peak: 0.00005
     end: 1.0e-06
     warmup_epochs: 3
