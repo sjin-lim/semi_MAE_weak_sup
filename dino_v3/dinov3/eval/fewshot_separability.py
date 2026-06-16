@@ -53,6 +53,7 @@ _DINOV3_ROOT = _THIS.parents[2]  # .../dino_v3
 if str(_DINOV3_ROOT) not in sys.path:
     sys.path.insert(0, str(_DINOV3_ROOT))
 
+import dinov3.distributed as distributed  # noqa: E402
 from dinov3.eval.setup import setup_and_build_model  # noqa: E402
 from dinov3.eval.em_aug import build_em_eval_transform, build_em_train_transform  # noqa: E402
 
@@ -227,6 +228,12 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
+
+    # 분산 초기화 (단일 프로세스 MANUAL 폴백 — torchrun 불필요).
+    # setup_config 의 apply_scaling_rules_to_cfg 가 distributed.is_enabled() 를 assert 하므로
+    # 모델 로드 전에 반드시 켜야 한다.
+    if not distributed.is_enabled():
+        distributed.enable(overwrite=True)
 
     # 1) 모델 (teacher backbone) 로드
     logger.info("모델 로드 중...")
