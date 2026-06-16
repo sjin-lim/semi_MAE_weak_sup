@@ -4,9 +4,11 @@
 얼마나 잘 분리하는지 빠르게 검사하는 도구. 분산(distributed) 없이 **단일 GPU** 로 동작.
 
 관련 파일:
-- [fewshot_separability.py](fewshot_separability.py) — 진단 본체
+- [fewshot_separability.py](fewshot_separability.py) — 분리도/few-shot 진단 본체
+- [fewshot_heatmap.py](fewshot_heatmap.py) — class-evidence heatmap (어디 보고 판단했나)
 - [em_aug.py](em_aug.py) — EM classification augmentation
-- [../../../scripts/eval_separability.sh](../../../scripts/eval_separability.sh) — 실행 래퍼
+- [../../../scripts/eval_separability.sh](../../../scripts/eval_separability.sh) — 진단 래퍼
+- [../../../scripts/eval_heatmap.sh](../../../scripts/eval_heatmap.sh) — heatmap 래퍼
 
 ---
 
@@ -104,6 +106,26 @@ python dinov3/eval/fewshot_separability.py \
 - **inter-class cosine 낮고 NCM/logreg 높음** → DINO feature 가 이미 분리. 바로 few-shot 본선.
 - **NCM 낮은데 logreg 높음** → 선형으론 갈리나 군집 중심이 안 떨어짐. weak-sup 추가 학습이 도움 신호.
 - **둘 다 낮음** → feature 가 클래스 신호를 안 담음. 폴더 클래스 정의 점검 또는 Stage2/3 weak-sup 학습 필요.
+
+---
+
+## 4b. heatmap — 어디 보고 그 클래스로 판단했나
+
+분류기가 `CLS + patch-mean concat` 위에서 돌기 때문에 클래스 점수를 **패치별로
+정확히 분해**할 수 있다: `score_c = W_cls·cls + mean_p(W_patch·patch_p) + b` →
+각 패치 기여도 = `W_patch·patch_p`. 이걸 격자로 reshape→업샘플→원본에 overlay.
+
+```bash
+DATA_ROOT=/path/to/class_folders \
+WEIGHTS=/path/to/teacher_checkpoint.pth \
+PER_CLASS=4 \
+bash scripts/eval_heatmap.sh
+```
+
+- `CLF`: `logreg`(기본) / `ncm`. `TARGET`: `pred`(예측) / `true`(정답) 클래스 기준.
+- `QUERY_DIR` 지정 시 그 폴더 이미지로, 미지정 시 `DATA_ROOT`에서 클래스당 `PER_CLASS`장.
+- 출력 PNG: **빨강=해당 클래스 지지 영역, 파랑=반대** (seismic, 0 중심).
+- ⚠️ `--feature concat` 전용(patch 분기를 분해해야 하므로). cls-only 는 공간 정보 없음.
 
 ---
 
