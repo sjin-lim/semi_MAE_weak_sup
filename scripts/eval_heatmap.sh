@@ -15,6 +15,7 @@ PER_CLASS="${PER_CLASS:-4}"
 IMAGE_SIZE="${IMAGE_SIZE:-448}"
 CLF="${CLF:-logreg}"                # logreg | ncm
 TARGET="${TARGET:-pred}"            # pred | true
+MODE="${MODE:-contrastive}"        # contrastive | raw
 
 EXTRA=()
 if [[ -n "${QUERY_DIR}" ]]; then EXTRA+=(--query-dir "${QUERY_DIR}"); fi
@@ -27,6 +28,7 @@ python dino_v3/dinov3/eval/fewshot_heatmap.py \
     --image-size "${IMAGE_SIZE}" \
     --clf "${CLF}" \
     --target "${TARGET}" \
+    --mode "${MODE}" \
     --output-dir "${OUTPUT_DIR}" \
     "${EXTRA[@]}" \
     "$@"

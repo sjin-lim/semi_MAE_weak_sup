@@ -118,7 +118,7 @@ def overlay_heatmap(orig_pil, heat, out_path, title, alpha=0.5):
     ax[0].set_title("input")
     ax[0].axis("off")
     ax[1].imshow(img, cmap="gray")
-    vmax = float(np.abs(heat).max()) + 1e-8
+    vmax = float(np.percentile(np.abs(heat), 99)) + 1e-8  # robust (아웃라이어 무시)
     hm = ax[1].imshow(heat, cmap="seismic", vmin=-vmax, vmax=vmax, alpha=alpha)
     ax[1].set_title(title)
     ax[1].axis("off")
@@ -140,6 +140,8 @@ def main():
     ap.add_argument("--clf", choices=["logreg", "ncm"], default="logreg")
     ap.add_argument("--target", choices=["pred", "true"], default="pred",
                     help="heatmap 의 대상 클래스: 예측(pred) 또는 정답(true)")
+    ap.add_argument("--mode", choices=["contrastive", "raw"], default="contrastive",
+                    help="contrastive: W_patch[target]-mean(others) (판별 영역 부각). raw: DC만 제거")
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--num-workers", type=int, default=8)
@@ -195,9 +197,16 @@ def main():
 
         target = pred if args.target == "pred" or true_lab < 0 else true_lab
 
-        # 패치별 기여도: W_patch[target] · patch_p
-        wp = torch.from_numpy(w_patch[target])  # [C]
+        # 패치별 기여도. contrastive: 다른 클래스 대비 판별 신호 (공통 DC 제거).
+        if args.mode == "contrastive" and num_classes > 1:
+            others = np.delete(np.arange(num_classes), target)
+            w_vec = w_patch[target] - w_patch[others].mean(axis=0)
+        else:  # raw
+            w_vec = w_patch[target]
+        wp = torch.from_numpy(w_vec)  # [C]
         heat_grid = torch.einsum("chw,c->hw", patch_grid, wp).numpy()  # [h,w]
+        if args.mode == "raw":
+            heat_grid = heat_grid - heat_grid.mean()
         # 업샘플
         heat = torch.nn.functional.interpolate(
             torch.from_numpy(heat_grid)[None, None], size=(args.image_size, args.image_size),

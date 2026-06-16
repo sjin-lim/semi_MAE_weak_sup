@@ -123,8 +123,10 @@ bash scripts/eval_heatmap.sh
 ```
 
 - `CLF`: `logreg`(기본) / `ncm`. `TARGET`: `pred`(예측) / `true`(정답) 클래스 기준.
+- `MODE`: `contrastive`(기본) / `raw`. **contrastive** = `W_patch[target]-mean(others)` 로
+  공통 DC 성분을 제거해 판별 영역만 부각. raw 로 두면 거의 전체가 빨갛게 나오기 쉬움.
 - `QUERY_DIR` 지정 시 그 폴더 이미지로, 미지정 시 `DATA_ROOT`에서 클래스당 `PER_CLASS`장.
-- 출력 PNG: **빨강=해당 클래스 지지 영역, 파랑=반대** (seismic, 0 중심).
+- 출력 PNG: **빨강=해당 클래스 지지 영역, 파랑=반대** (seismic, 99퍼센타일 robust 스케일).
 - ⚠️ `--feature concat` 전용(patch 분기를 분해해야 하므로). cls-only 는 공간 정보 없음.
 
 ---
