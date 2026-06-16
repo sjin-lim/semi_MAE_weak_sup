@@ -129,6 +129,45 @@ bash scripts/eval_heatmap.sh
 
 ---
 
+## 4c. 모델 저장/로드/추론 (서빙용)
+
+[em_classifier.py](em_classifier.py) — few-shot 헤드를 학습·저장하고, 나중에
+로드해서 추론. 마이크로서비스화를 위해 **헤드(순수 numpy)와 백본(torch)을 분리**.
+
+구조:
+- `ClassifierHead` — `W·x+b`, 순수 numpy. 저장/로드/추론에 torch 불필요.
+- `EMFeatureExtractor` — DINO 백본 wrapper (torch, lazy import). PIL → concat feature.
+- `EMClassifier` — 둘 결합, end-to-end. `from_artifact(path)` 한 번으로 추론 준비.
+
+아티팩트(`.npz`) 하나에 W/bias/클래스명 + feature 설정 + 백본 config/weights 경로 packing.
+
+```bash
+# 1) 학습 + 아티팩트 저장
+python dinov3/eval/em_classifier.py fit \
+    --config-file dinov3/configs/train/weaksup/stage2_ssl_weaksup.yaml \
+    --pretrained-weights /path/to/teacher_checkpoint.pth \
+    --data-root /path/to/class_folders \
+    --clf logreg --out ./out/em_head.npz
+
+# 2) 로드 + 추론 (이미지 또는 폴더). 백본 경로는 아티팩트에서 자동.
+python dinov3/eval/em_classifier.py predict \
+    --artifact ./out/em_head.npz \
+    --input /path/to/query_or_dir --topk 3
+```
+
+코드에서:
+```python
+from dinov3.eval.em_classifier import EMClassifier
+from PIL import Image
+clf = EMClassifier.from_artifact("./out/em_head.npz")   # 백본 1회 로드
+print(clf.predict(Image.open("x.png")))                  # {'label','score','topk'}
+```
+
+테스트: `pytest tests/classification` (헤드 테스트는 numpy 만으로 동작;
+end-to-end 통합은 `EM_TEST_CONFIG/EM_TEST_CKPT/EM_TEST_DATA` + CUDA 지정 시 실행).
+
+---
+
 ## 5. 주의
 
 - **정규화 일치**: 학습이 `crops.instance_norm: true` 이므로 eval 도 PerImageNormalize.
