@@ -1,0 +1,257 @@
+# ============================================================
+# Stage 2 (LONG): SSL + Weak Supervised — 긴 스케줄 변형
+#
+# stage2_ssl_weaksup.yaml 과 동일하되 학습 길이만 3× (≈30k iter, 96 epoch).
+# 차이점만:
+#   - optim.epochs        30 → 96
+#   - schedules.lr.cosine_epochs  27 → 93   (cosine = epochs − warmup 3)
+#   - checkpointing.keep_every  → 9600 (30 epoch 마다 milestone 보존, before/after eval 용)
+#   - train.output_dir    → ./out/stage2_long
+#
+# 왜 긴가:
+#   1× (9.6k) 는 weak-sup floor 는 도달하나 wave-aug(전 데이터 consistency, 느림)
+#   가 덜 익고 저-LR consolidation 구간이 짧음. 3× 가 sweet spot. 더 필요하면
+#   --no-resume 빼고 같은 output_dir 로 epochs 늘려 재실행하면 연장(optimizer 이어받음).
+#
+# 멈춤/연장 신호: merged_pair_ratio→0, iBOT 안정, eval AUC/cosine plateau.
+#
+# 출발점:
+#   EM foundation(= Stage 1 SSL, 16만장) teacher checkpoint. DINO 공개 weight 아님.
+#
+# 실행:
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/weaksup/stage2_ssl_weaksup_long.yaml \
+#       --no-resume \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       weak_sup.labeled_root=/path/to/labeled_data \
+#       student.resume_from_teacher_chkpt=/path/to/EM_foundation/teacher_checkpoint.pth \
+#       train.output_dir=./out/stage2_long
+#   # 연장 시: --no-resume 제거 + optim.epochs 상향, 같은 output_dir 로 재실행.
+#   # 5× 원하면: optim.epochs=156 schedules.lr.cosine_epochs=153 (CLI override).
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  loss_weight: 1.5
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+  mask_random_circular_shift: false
+  information_aware_masking: false
+  masking_temperature: 0.5
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 1024
+
+gram:
+  use_loss: false
+  compute_stats: false
+  loss_weight: 0.0
+  ema_teacher: false
+  ckpt: null
+  it_load_ema_teacher: -1
+  rep_update: false
+  update_frequency: 10000
+  it_first_update: 999999999
+  max_updates: 0
+  normalized: true
+  img_level: true
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+
+# ── NEW: weak supervision ON ───────────────────────────────────────────
+weak_sup:
+  enabled: true
+  # ── Labeled data ───────────────────────────────────────────────────
+  labeled_root: ''                # CLI override
+  labeled_ratio: 0.25             # 매 step 25% 확률로 labeled batch 사용
+  num_workers_labeled: 4
+  batch_size_labeled: 16          # per-GPU labeled batch
+  # ── Loss formulation (HINGE ANTI-MERGE) ───────────────────────────
+  # margin=0.85: cross-class patch sim 이 0.85 초과로 "합쳐진" 쌍만 떼어냄.
+  #   0.85 이하는 이미 구분된 것으로 보고 force=0 (이전 exp-push 는 sim=0.5 에도
+  #   force 0.4 가 남아 iBOT 를 흩뜨림 → 폐기). 타겟 = >0.9 옅은-경계 쌍.
+  margin: 0.85
+  hinge_power: 2.0                # 제곱: margin 근처에서 force 0→부드럽게 (1.0=선형, 급함)
+  # lambda_W: hinge 는 대부분 쌍이 0 이라 weak_loss 평균값이 작음 → exp 때보다 크게 둠.
+  #   weak_loss 가 dino/ibot 대비 너무 작으면(<0.02) ↑, merged_pair_ratio 안 떨어지면 ↑.
+  lambda_W: 30.0
+  warmup_steps: 1000              # 0 → lambda_W 점진 증가
+  # ── Patch handling ────────────────────────────────────────────────
+  background_class: 0
+  skip_background: true           # bg pair 제외
+  min_patches_per_class: 4
+  min_nonbg_classes: 2            # non-bg class 2개 미만 image 제외 (pair 없음 → labeled batch 낭비 방지)
+  patch_purity_threshold: 0.8     # boundary patch (purity<0.8)는 ignore → cross-class noise 회피. 0.0=off
+  ignore_label: -1
+  # ── Monitoring ────────────────────────────────────────────────────
+  log_pair_stats: true            # pair_sim_max/mean 등 logging
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./out/stage2_long"
+
+  batch_size_per_gpu: 128
+  num_workers: 10
+  seed: 0
+  OFFICIAL_EPOCH_LENGTH: 320
+
+  saveckp_freq: 20
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_base
+  patch_size: 16
+  pretrained_weights: ''
+  resume_from_teacher_chkpt: ''       # CLI override (EM foundation teacher)
+  drop_path_rate: 0.2
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.999             # Stage 2 보수적 (이미 안정)
+  final_momentum_teacher: 0.9999
+  warmup_teacher_temp: 0.07
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0
+
+optim:
+  epochs: 96                          # LONG: 30 → 96 (3×, ≈30k iter). 5× 는 156.
+  optimizer: adamw
+  weight_decay: 0.15
+  weight_decay_end: 0.15
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 0.9
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 224
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  local_crops_number: 8
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: false
+  intensity_aug:
+    # 밝기 aug 최소화 (docs/ANALYSIS_grayscale_separation.md §5,6):
+    # gamma/CLAHE = K1(절대레벨 invariance 강제) 주범 → off.
+    # disk_blur = K3(경계 흐림) 악화 → 약화. poisson(노이즈)·기하·masking 은 유지(SSL 핵심).
+    clahe_p: 0.0
+    gamma_p: 0.0
+    poisson_p: 0.3
+    disk_blur_p_global1: 0.1
+    disk_blur_p_global2: 0.0
+    disk_blur_p_local: 0.1
+  # ── Wave (반사/ripple) augmentation ─────────────────────────────────
+  # 물질 내 밝기 변화(반사) invariance. student global view 에만 적용 →
+  # teacher(clean anchor) 와의 consistency 가 "ripple = noise" 학습.
+  # pull loss 대체 (정보 비파괴·전 데이터 적용·per-task 충돌 없음). docs §6.
+  # band/amp 는 notebooks/wave_artifact_analysis.ipynb 실측 기반.
+  wave_aug:
+    enabled: true
+    k_lo: 0.001                   # ripple band 하한 (cycles/pixel)
+    k_hi: 0.0031                  # 상한 (저주파라 step 경계[고주파]는 보존)
+    amp: 0.12                     # 상대 ripple std (real 0.30 의 ~40%, DC 침범 회피)
+    direction: null               # 등방성 (측정된 방향성 있으면 deg)
+    dir_width: 30.0
+    p: 0.5                        # 있는/없는 이미지 자연 혼합
+    amp_jitter: true              # amp 를 [0, amp] 랜덤
+    mode: mult                    # mean 보존 곱셈
+    spatial_envelope_p: 0.3       # 30% 는 국소(물질 내부) ripple
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  period: 1200                        # iter 단위 저장 주기
+  max_to_keep: 6
+  keep_every: 9600                    # 30 epoch 마다 milestone 보존 (before/after eval 용)
+
+evaluation:
+  eval_period_iterations: 1600        # 5 epoch 마다
+
+schedules:
+  weight_decay:
+    start: 0.15
+    peak: 0.15
+    end: 0.15
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.07
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 0
+  lr:
+    start: 0
+    # Stage 2 peak 5e-5: 1e-4 는 iBOT loss 악화(3.0→3.8)의 주범 → 되돌림. weak push 의
+    # 실효는 LR 이 아니라 margin(force 위치)로 확보. layerwise_decay 0.9 가 깊은 층 더 움직임.
+    # (iBOT 안정 + merged_pair_ratio 0 수렴이면 성공. 정체면 margin↓/lambda↑ — HANDOFF §11)
+    peak: 0.00005
+    end: 1.0e-06
+    warmup_epochs: 3
+    freeze_last_layer_epochs: 0
+    cosine_epochs: 93                 # LONG: 27 → 93 (= epochs 96 − warmup 3)
+  momentum:
+    start: 0.999
+    peak: 0.999
+    end: 0.9999
+    warmup_epochs: 0
