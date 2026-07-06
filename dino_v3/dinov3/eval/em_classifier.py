@@ -193,11 +193,18 @@ class EMFeatureExtractor:
 
         return build_em_eval_transform(self.image_size)
 
-    def features(self, images, batch_size: int = 32) -> np.ndarray:
-        """images: PIL.Image 또는 그 리스트 → np.ndarray [B, D] (L2 정규화)."""
+    def embed(self, images, feature_kind: Optional[str] = None, n_blocks: Optional[int] = None,
+              batch_size: int = 32) -> np.ndarray:
+        """images: PIL.Image 또는 리스트 → np.ndarray [B, D] (L2 정규화).
+
+        feature_kind / n_blocks 를 요청별로 override 가능(범용 feature 서비스용).
+        기본값은 인스턴스 설정(self.feature_kind / self.n_blocks).
+        """
         import torch
         from PIL import Image
 
+        kind = feature_kind or self.feature_kind
+        nb = n_blocks or self.n_blocks
         if isinstance(images, Image.Image):
             images = [images]
         tf = self._transform()
@@ -209,12 +216,16 @@ class EMFeatureExtractor:
                 x = torch.stack([tf(im.convert("RGB")) for im in batch]).to(device)
                 with torch.autocast("cuda", dtype=self.autocast_dtype):
                     outs = self.model.get_intermediate_layers(
-                        x, n=self.n_blocks, reshape=False, return_class_token=True, norm=True
+                        x, n=nb, reshape=False, return_class_token=True, norm=True
                     )
                 cls = torch.cat([ct for (_, ct) in outs], dim=-1)
-                f = pool_tokens(cls, outs[-1][0], self.feature_kind)
+                f = pool_tokens(cls, outs[-1][0], kind)
                 out.append(f.float().cpu().numpy())
         return np.concatenate(out, axis=0)
+
+    def features(self, images, batch_size: int = 32) -> np.ndarray:
+        """embed() 의 기본 설정 래퍼 (하위호환)."""
+        return self.embed(images, batch_size=batch_size)
 
 
 # --------------------------------------------------------------------------- #
