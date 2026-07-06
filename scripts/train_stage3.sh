@@ -13,7 +13,9 @@
 #     베이스로 쓰고 해상도만 라운드별 override (검증된 path).
 #
 # 각 라운드 산출 teacher: <output>/res<R>/eval/<iter>/teacher_checkpoint.pth
-# (do_test 는 eval_period 마다만 저장 → 라운드 끝에 1회 eval 을 강제해 chain 보장)
+# (do_test 는 eval_period 마다만 저장. eval_period=라운드iters 로 두면 "맨 끝 1회"만
+#  발화 → 경계 off-by-one 으로 0개 될 수 있어, N_EVALS 로 라운드당 여러 번 발화시켜
+#  chain 을 보장. 다음 라운드는 mtime 최신 teacher_checkpoint.pth 를 자동 선택.)
 #
 # ────────────────────────────────────────────────────────────
 # 사용법
@@ -66,7 +68,9 @@ LR_PEAK="${LR_PEAK:-2.0e-5}"         # hires 적응은 낮은 LR
 LABELED_RATIO="${LABELED_RATIO:-0.15}"
 LAMBDA_W="${LAMBDA_W:-10.0}"         # light preservation (stage2 30 → 10)
 WARMUP_EPOCHS="${WARMUP_EPOCHS:-1}"
-EPOCH_LEN="${EPOCH_LEN:-320}"        # OFFICIAL_EPOCH_LENGTH (config 와 일치)
+EPOCH_LEN="${EPOCH_LEN:-320}"        # OFFICIAL_EPOCH_LENGTH (아래서 override 로 강제)
+N_EVALS="${N_EVALS:-4}"             # 라운드당 eval(=teacher 저장) 횟수. 마지막 1회만 두면
+                                    # 경계 off-by-one 으로 0개 될 수 있어 여러 번 발화시킴
 
 # scalar-crop 검증 경로 (multi-res 리스트 config 아님)
 CONFIG="${CONFIG:-dino_v3/dinov3/configs/train/weaksup/stage2_ssl_weaksup.yaml}"
@@ -99,6 +103,9 @@ for i in "${!RES_STEPS[@]}"; do
     LOCAL=$(( (R / LOCAL_DIV / 16) * 16 ));  (( LOCAL < 16 )) && LOCAL=16
     COSINE=$(( E - WARMUP_EPOCHS ));         (( COSINE < 1 )) && COSINE=1
     ROUND_ITERS=$(( E * EPOCH_LEN ))
+    # eval 을 라운드당 N_EVALS 번 발화 (마지막 경계 miss 방지). max_iter 를 EPOCH_LEN
+    # override 로 통제하니 EVAL_PERIOD 는 ROUND_ITERS 를 정확히 나눔.
+    EVAL_PERIOD=$(( ROUND_ITERS / N_EVALS )); (( EVAL_PERIOD < 1 )) && EVAL_PERIOD=${ROUND_ITERS}
     OUT="${OUTPUT_ROOT}/res${R}"
     mkdir -p "${OUT}"
 
@@ -106,7 +113,7 @@ for i in "${!RES_STEPS[@]}"; do
     echo "[upscale] round $((i+1))/${N}  res=${R}  batch=${B}  epochs=${E}  local=${LOCAL}x${LOCAL_NUM}"
     echo "[upscale] resume : ${RESUME_CKPT}"
     echo "[upscale] output : ${OUT}"
-    echo "[upscale] iters=${ROUND_ITERS}  eval@round-end 보장"
+    echo "[upscale] iters=${ROUND_ITERS}  eval_period=${EVAL_PERIOD} (x${N_EVALS} teacher 저장)"
     echo "======================================================="
 
     torchrun --nproc_per_node="${NPROC}" \
@@ -125,16 +132,20 @@ for i in "${!RES_STEPS[@]}"; do
         "crops.local_crops_number=${LOCAL_NUM}" \
         "train.batch_size_per_gpu=${B}" \
         "optim.epochs=${E}" \
+        "train.OFFICIAL_EPOCH_LENGTH=${EPOCH_LEN}" \
         "schedules.lr.peak=${LR_PEAK}" \
         "schedules.lr.warmup_epochs=${WARMUP_EPOCHS}" \
         "schedules.lr.cosine_epochs=${COSINE}" \
-        "evaluation.eval_period_iterations=${ROUND_ITERS}" \
+        "evaluation.eval_period_iterations=${EVAL_PERIOD}" \
         "$@"
 
     NEXT_CKPT="$(find_teacher "${OUT}" || true)"
     if [ -z "${NEXT_CKPT}" ]; then
         echo "ERROR: ${OUT}/eval 에서 teacher_checkpoint.pth 없음."
-        echo "       eval 이 안 돌았을 수 있음 (eval_period_iterations vs iters 확인)."
+        echo "       eval 이 안 돌았을 수 있음 (eval_period_iterations=${EVAL_PERIOD} vs iters=${ROUND_ITERS})."
+        echo "       eval 폴더 내용:"
+        ls -la "${OUT}/eval" 2>/dev/null || echo "         (eval 폴더 자체가 없음)"
+        echo "       sharded 로 저장됐다면 sharded_teacher_checkpoint/ 디렉토리를 RESUME 로 직접 지정 가능."
         exit 1
     fi
     echo "[upscale] round $((i+1)) 완료 → teacher: ${NEXT_CKPT}"
