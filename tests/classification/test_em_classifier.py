@@ -10,7 +10,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from dinov3.eval.em_classifier import ClassifierHead, _softmax, pool_tokens  # noqa: E402
+from dinov3.eval.em_classifier import ClassifierHead, DefectRegistry, _softmax, pool_tokens  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -109,6 +109,78 @@ def test_save_appends_npz(tmp_path):
 def test_shape_assertions():
     with pytest.raises(AssertionError):
         ClassifierHead(np.zeros((2, 4)), np.zeros(3), ["a", "b"])  # bias/class 수 불일치
+
+
+# --------------------------------------------------------------------------- #
+# DefectRegistry — 증분 불량 추가/삭제 (순수 numpy)
+# --------------------------------------------------------------------------- #
+def _feats(center_idx, n=20, dim=32, seed=0):
+    rng = np.random.default_rng(seed + center_idx)
+    c = np.eye(1, dim, center_idx, dtype=np.float32)[0]
+    pts = c + 0.15 * rng.standard_normal((n, dim)).astype(np.float32)
+    return pts / (np.linalg.norm(pts, axis=1, keepdims=True) + 1e-8)
+
+
+def test_registry_enroll_and_build_head():
+    reg = DefectRegistry(meta={"feature_kind": "concat"})
+    reg.enroll("scratch", _feats(0))
+    reg.enroll("dent", _feats(1))
+    assert reg.classes == ["dent", "scratch"]           # 정렬됨
+    assert reg.counts() == {"dent": 20, "scratch": 20}
+    head = reg.build_head(kind="ncm")
+    assert head.class_names == ["dent", "scratch"]
+    # 각 클러스터 중심으로 예측 정확
+    assert (head.predict(_feats(0)) == head.class_names.index("scratch")).mean() > 0.95
+
+
+def test_registry_incremental_add_new_defect():
+    """새 불량 추가 시 기존 클래스 유지 + 새 클래스 반영 (forgetting 없음)."""
+    reg = DefectRegistry()
+    reg.enroll("a", _feats(0)); reg.enroll("b", _feats(1))
+    h1 = reg.build_head(kind="ncm")
+    assert h1.num_classes == 2
+    reg.enroll("c", _feats(2))                            # 새 불량 등록
+    h2 = reg.build_head(kind="ncm")
+    assert h2.num_classes == 3 and "c" in h2.class_names
+    assert set(["a", "b"]).issubset(h2.class_names)      # 기존 유지
+
+    reg.enroll("a", _feats(0, seed=99))                   # 같은 클래스에 예시 누적
+    assert reg.counts()["a"] == 40
+
+
+def test_registry_remove():
+    reg = DefectRegistry()
+    reg.enroll("a", _feats(0)); reg.enroll("b", _feats(1))
+    reg.remove("a")
+    assert reg.classes == ["b"]
+
+
+def test_registry_dim_mismatch_raises():
+    reg = DefectRegistry()
+    reg.enroll("a", _feats(0, dim=32))
+    with pytest.raises(ValueError):
+        reg.enroll("b", _feats(1, dim=16))
+
+
+def test_registry_save_load_roundtrip(tmp_path):
+    reg = DefectRegistry(meta={"config_file": "/x.yaml", "n_blocks": 1})
+    reg.enroll("scratch", _feats(0)); reg.enroll("dent", _feats(1))
+    path = reg.save(str(tmp_path / "reg"))
+    assert path.endswith(".npz")
+
+    loaded = DefectRegistry.load(path)
+    assert loaded.classes == reg.classes
+    assert loaded.counts() == reg.counts()
+    assert loaded.meta["config_file"] == "/x.yaml"
+    for n in reg.classes:
+        assert np.allclose(loaded.features[n], reg.features[n])
+
+
+def test_registry_single_class_falls_back_to_ncm():
+    reg = DefectRegistry()
+    reg.enroll("only", _feats(0))
+    head = reg.build_head(kind="logreg")   # 1클래스 → ncm 폴백
+    assert head.num_classes == 1
 
 
 # --------------------------------------------------------------------------- #

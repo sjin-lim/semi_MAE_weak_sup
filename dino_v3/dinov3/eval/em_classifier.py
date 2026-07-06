@@ -241,6 +241,23 @@ class EMClassifier:
         )
         return cls(extractor, head)
 
+    @classmethod
+    def from_registry(cls, registry_path: str, kind: str = "logreg", config_file: Optional[str] = None,
+                      pretrained_weights: Optional[str] = None, cache_dir: str = "./.em_cache") -> "EMClassifier":
+        """DefectRegistry 로드 → 헤드 재구성 + 백본 구성. 증분 추가된 불량 반영."""
+        reg = DefectRegistry.load(registry_path)
+        head = reg.build_head(kind=kind)
+        m = reg.meta
+        extractor = EMFeatureExtractor(
+            config_file=config_file or m["config_file"],
+            pretrained_weights=pretrained_weights or m["pretrained_weights"],
+            image_size=int(m.get("image_size", 448)),
+            n_blocks=int(m.get("n_blocks", 1)),
+            feature_kind=m.get("feature_kind", "concat"),
+            cache_dir=cache_dir,
+        )
+        return cls(extractor, head)
+
     def predict(self, images, topk: int = 1, batch_size: int = 32) -> List[dict]:
         """images: PIL 또는 리스트 → [{label, score, topk:[(name,prob)...]}]"""
         from PIL import Image
@@ -261,7 +278,109 @@ class EMClassifier:
 
 
 # --------------------------------------------------------------------------- #
-# 5) 학습 편의 함수 + CLI
+# 5) 증분 불량 registry — 백본 재학습 없이 클래스 추가/삭제
+# --------------------------------------------------------------------------- #
+class DefectRegistry:
+    """클래스별 feature 캐시 은행. 불량을 그때그때 추가/삭제하고 헤드를 재구성.
+
+    feature(추출 결과)만 저장하므로 헤드 재구성은 백본 forward 없이 즉시(sklearn ms).
+    순수 numpy → torch 없이 저장/로드/재구성 가능(서빙·테스트 친화).
+    """
+
+    def __init__(self, meta: Optional[dict] = None):
+        self.features: dict = {}   # name -> np.ndarray [n_i, D]
+        self.meta = dict(meta or {})
+
+    @property
+    def classes(self) -> List[str]:
+        return sorted(self.features.keys())
+
+    def counts(self) -> dict:
+        return {n: int(len(self.features[n])) for n in self.classes}
+
+    @property
+    def feature_dim(self) -> Optional[int]:
+        for n in self.features:
+            return int(self.features[n].shape[1])
+        return None
+
+    def enroll(self, name: str, feats: np.ndarray) -> "DefectRegistry":
+        """이미 추출된 feature [n, D] 를 클래스 name 에 추가(누적)."""
+        feats = np.atleast_2d(np.asarray(feats, dtype=np.float32))
+        if self.feature_dim is not None and feats.shape[1] != self.feature_dim:
+            raise ValueError(f"feature dim 불일치: {feats.shape[1]} != {self.feature_dim}")
+        if name in self.features:
+            self.features[name] = np.vstack([self.features[name], feats])
+        else:
+            self.features[name] = feats
+        return self
+
+    def remove(self, name: str) -> "DefectRegistry":
+        self.features.pop(name, None)
+        return self
+
+    def build_head(self, kind: str = "logreg") -> ClassifierHead:
+        """현재 캐시로 헤드 재구성. 클래스 1개면 logreg 불가 → ncm 로 폴백."""
+        names = self.classes
+        if len(names) == 0:
+            raise ValueError("등록된 클래스가 없음")
+        X = np.vstack([self.features[n] for n in names])
+        y = np.concatenate([np.full(len(self.features[n]), i) for i, n in enumerate(names)])
+        if kind == "logreg" and len(names) < 2:
+            kind = "ncm"
+        return ClassifierHead.fit(X, y, names, kind=kind, meta=self.meta)
+
+    def save(self, path: str) -> str:
+        path = str(path)
+        if not path.endswith(".npz"):
+            path += ".npz"
+        meta = dict(self.meta)
+        meta["_artifact_version"] = ARTIFACT_VERSION
+        d = {"__names__": np.array(self.classes, dtype=object), "__meta__": json.dumps(meta, ensure_ascii=False)}
+        for n in self.classes:
+            d[f"feat::{n}"] = self.features[n]
+        np.savez(path, **d)
+        logger.info(f"registry 저장: {path} (classes={self.counts()})")
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "DefectRegistry":
+        npz = np.load(path, allow_pickle=True)
+        meta = json.loads(str(npz["__meta__"]))
+        reg = cls(meta)
+        for n in list(npz["__names__"]):
+            reg.features[str(n)] = npz[f"feat::{n}"]
+        return reg
+
+
+def enroll_dir(extractor: EMFeatureExtractor, registry: DefectRegistry, name: str, image_dir: str,
+               batch_size: int = 32) -> DefectRegistry:
+    """image_dir 의 이미지들에서 feature 추출 → registry 의 클래스 name 에 등록."""
+    from PIL import Image
+
+    exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+    paths = [p for p in sorted(Path(image_dir).rglob("*")) if p.suffix.lower() in exts]
+    if not paths:
+        raise ValueError(f"이미지 없음: {image_dir}")
+    imgs = [Image.open(p).convert("RGB") for p in paths]
+    feats = extractor.features(imgs, batch_size=batch_size)
+    # 백본/feature 설정을 registry meta 에 기록(최초 등록 시)
+    if not registry.meta:
+        registry.meta = {
+            "feature_kind": extractor.feature_kind,
+            "n_blocks": extractor.n_blocks,
+            "image_size": extractor.image_size,
+            "embed_dim": extractor.embed_dim,
+            "config_file": str(Path(extractor.config_file).resolve()),
+            "pretrained_weights": str(Path(extractor.pretrained_weights).resolve()),
+        }
+    registry.enroll(name, feats)
+    logger.info(f"'{name}' 에 {len(paths)}장 등록 (누적 {registry.counts()[name]}장)")
+    return registry
+
+
+# --------------------------------------------------------------------------- #
+# 6) 학습 편의 함수 + CLI
 # --------------------------------------------------------------------------- #
 def fit_from_imagefolder(extractor: EMFeatureExtractor, data_root: str, kind: str = "logreg",
                          batch_size: int = 32, num_workers: int = 8) -> ClassifierHead:
@@ -299,10 +418,18 @@ def _cli_fit(args):
 
 
 def _cli_predict(args):
-    clf = EMClassifier.from_artifact(
-        args.artifact, config_file=args.config_file, pretrained_weights=args.pretrained_weights,
-        cache_dir=args.cache_dir,
-    )
+    if args.registry:
+        clf = EMClassifier.from_registry(
+            args.registry, kind=args.clf, config_file=args.config_file,
+            pretrained_weights=args.pretrained_weights, cache_dir=args.cache_dir,
+        )
+    elif args.artifact:
+        clf = EMClassifier.from_artifact(
+            args.artifact, config_file=args.config_file, pretrained_weights=args.pretrained_weights,
+            cache_dir=args.cache_dir,
+        )
+    else:
+        raise SystemExit("--artifact 또는 --registry 중 하나 필요")
     from PIL import Image
 
     paths = []
@@ -320,6 +447,39 @@ def _cli_predict(args):
     for q, r in zip(paths, res):
         tops = ", ".join(f"{n}:{s:.3f}" for n, s in r["topk"])
         print(f"{q.name}\t-> {r['label']} ({r['score']:.3f})\t[{tops}]")
+
+
+def _load_or_new_registry(path):
+    return DefectRegistry.load(path) if Path(path).exists() else DefectRegistry()
+
+
+def _cli_enroll(args):
+    reg = _load_or_new_registry(args.registry)
+    cfg = args.config_file or reg.meta.get("config_file")
+    ckpt = args.pretrained_weights or reg.meta.get("pretrained_weights")
+    if not cfg or not ckpt:
+        raise SystemExit("최초 등록 시 --config-file/--pretrained-weights 필요")
+    extractor = EMFeatureExtractor(
+        cfg, ckpt, image_size=int(reg.meta.get("image_size", args.image_size)),
+        n_blocks=int(reg.meta.get("n_blocks", args.n_blocks)),
+        feature_kind=reg.meta.get("feature_kind", args.feature), cache_dir=args.cache_dir,
+    )
+    enroll_dir(extractor, reg, args.name, args.image_dir, batch_size=args.batch_size)
+    reg.save(args.registry)
+    print(f"등록 완료. 현재 클래스: {reg.counts()}")
+
+
+def _cli_list(args):
+    reg = DefectRegistry.load(args.registry)
+    print(f"registry: {args.registry}  (dim={reg.feature_dim})")
+    for n, c in reg.counts().items():
+        print(f"  {n}: {c}장")
+
+
+def _cli_remove(args):
+    reg = DefectRegistry.load(args.registry)
+    reg.remove(args.name).save(args.registry)
+    print(f"'{args.name}' 삭제. 현재: {reg.counts()}")
 
 
 def main(argv=None):
@@ -343,14 +503,39 @@ def main(argv=None):
     f.add_argument("--cache-dir", default="./.em_cache")
     f.set_defaults(func=_cli_fit)
 
-    p = sub.add_parser("predict", help="아티팩트 로드 후 이미지/폴더 추론")
-    p.add_argument("--artifact", required=True)
+    p = sub.add_parser("predict", help="아티팩트/registry 로드 후 이미지/폴더 추론")
+    p.add_argument("--artifact", default=None, help="헤드 아티팩트(.npz)")
+    p.add_argument("--registry", default=None, help="불량 registry(.npz) — 지정 시 헤드 재구성")
+    p.add_argument("--clf", choices=["logreg", "ncm"], default="logreg", help="registry 추론 시 헤드 종류")
     p.add_argument("--input", required=True, help="이미지 파일 또는 폴더")
     p.add_argument("--topk", type=int, default=3)
     p.add_argument("--config-file", default=None, help="백본 config override (기본: 아티팩트 meta)")
     p.add_argument("--pretrained-weights", default=None, help="백본 weights override")
     p.add_argument("--cache-dir", default="./.em_cache")
     p.set_defaults(func=_cli_predict)
+
+    # 증분 불량 registry
+    e = sub.add_parser("enroll", help="불량 클래스 추가(백본 재학습 없음)")
+    e.add_argument("--registry", required=True, help="registry(.npz) — 없으면 새로 생성")
+    e.add_argument("--name", required=True, help="불량 클래스 이름")
+    e.add_argument("--image-dir", required=True, help="해당 불량 예시 이미지 폴더")
+    e.add_argument("--config-file", default=None, help="최초 등록 시 필요")
+    e.add_argument("--pretrained-weights", default=None, help="최초 등록 시 필요")
+    e.add_argument("--feature", choices=list(FEATURE_KINDS), default="concat")
+    e.add_argument("--n-blocks", type=int, default=1)
+    e.add_argument("--image-size", type=int, default=448)
+    e.add_argument("--batch-size", type=int, default=32)
+    e.add_argument("--cache-dir", default="./.em_cache")
+    e.set_defaults(func=_cli_enroll)
+
+    ls = sub.add_parser("list", help="registry 클래스/장수 조회")
+    ls.add_argument("--registry", required=True)
+    ls.set_defaults(func=_cli_list)
+
+    rm = sub.add_parser("remove", help="registry 에서 불량 클래스 삭제")
+    rm.add_argument("--registry", required=True)
+    rm.add_argument("--name", required=True)
+    rm.set_defaults(func=_cli_remove)
 
     args = ap.parse_args(argv)
     args.func(args)

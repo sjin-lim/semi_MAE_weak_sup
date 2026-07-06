@@ -168,6 +168,32 @@ print(clf.predict(Image.open("x.png")))                  # {'label','score','top
 테스트: `pytest tests/classification` (헤드 테스트는 numpy 만으로 동작;
 end-to-end 통합은 `EM_TEST_CONFIG/EM_TEST_CKPT/EM_TEST_DATA` + CUDA 지정 시 실행).
 
+### 증분 불량 추가 (백본 재학습 없음)
+
+불량이 그때그때 추가되는 시나리오 → `DefectRegistry` 로 **클래스별 feature 캐시**를
+누적. feature 만 저장하므로 헤드 재구성은 백본 forward 없이 즉시(sklearn ms).
+기존 클래스는 안 건드려 forgetting 없음. (closed-set 분류, 클래스당 20장+ 가정)
+
+```bash
+# 새 불량 등록 (최초엔 --config-file/--pretrained-weights 필요, 이후 생략 가능)
+python dinov3/eval/em_classifier.py enroll --registry ./out/defects.npz \
+    --name scratch --image-dir /data/scratch \
+    --config-file <cfg> --pretrained-weights <ckpt>
+python dinov3/eval/em_classifier.py enroll --registry ./out/defects.npz \
+    --name dent --image-dir /data/dent        # 새 불량 추가 = 캐시 append
+
+python dinov3/eval/em_classifier.py list   --registry ./out/defects.npz
+python dinov3/eval/em_classifier.py remove --registry ./out/defects.npz --name dent
+python dinov3/eval/em_classifier.py predict --registry ./out/defects.npz --input /data/query
+```
+
+코드에서:
+```python
+from dinov3.eval.em_classifier import EMClassifier
+clf = EMClassifier.from_registry("./out/defects.npz")   # 캐시 → 헤드 재구성 + 백본 로드
+clf.predict(Image.open("x.png"))
+```
+
 ---
 
 ## 5. 주의
