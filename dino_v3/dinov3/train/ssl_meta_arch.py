@@ -461,6 +461,7 @@ class SSLMetaArch(nn.Module):
                 per_image_losses = []
                 pair_stat_acc = {"pair_sim_max": 0.0, "pair_sim_mean": 0.0, "n_pairs": 0}
                 n_valid = 0
+                n_stat = 0            # pair-stat 이 집계된 image 수 (pair_sim_mean 평균용)
                 for i in range(stu_patches_flat.shape[0]):
                     feats_i = stu_patches_flat[i]
                     labels_i = patch_labels[i]
@@ -489,23 +490,33 @@ class SSLMetaArch(nn.Module):
                             )
                             pair_stat_acc["pair_sim_mean"] += stats["pair_sim_mean"]
                             pair_stat_acc["n_pairs"] += stats["n_pairs"]
+                            n_stat += 1
 
+                # weak_loss / lambda_w 는 labeled step 이면 항상 추가 (rank 간 동일).
                 if per_image_losses:
                     L_weak = torch.stack(per_image_losses).mean()
                     loss_accumulator = loss_accumulator + lambda_w * L_weak
-                    loss_dict["weak_loss"] = L_weak.detach()
-                    loss_dict["lambda_w"] = torch.as_tensor(lambda_w, device=L_weak.device)
-                    if getattr(weak_sup_cfg, "log_pair_stats", False) and n_valid > 0:
-                        loss_dict["pair_sim_max"] = torch.as_tensor(
-                            pair_stat_acc["pair_sim_max"], device=L_weak.device
-                        )
-                        loss_dict["pair_sim_mean"] = torch.as_tensor(
-                            pair_stat_acc["pair_sim_mean"] / max(n_valid, 1), device=L_weak.device
-                        )
+                    weak_loss_val = L_weak.detach()
                 else:
-                    # 모든 image 가 self-curriculum 이후 → loss 0
-                    loss_dict["weak_loss"] = torch.zeros((), device=stu_patches.device)
-                    loss_dict["lambda_w"] = torch.as_tensor(lambda_w, device=stu_patches.device)
+                    # valid pair 없음(self-curriculum 완료 등) → loss 0 (grad 없음)
+                    weak_loss_val = torch.zeros((), device=stu_patches.device)
+                loss_dict["weak_loss"] = weak_loss_val
+                loss_dict["lambda_w"] = torch.as_tensor(lambda_w, device=stu_patches.device)
+                # ⚠️ DISTRIBUTED 정합성: pair_sim_* 는 배치 내용과 무관하게 log_pair_stats
+                #   이면 *항상* 추가한다. rank 마다 loss_dict 키 개수가 달라지면 다음 step 의
+                #   metrics all_reduce(train.py)가 shape 불일치로 hang → NCCL timeout/barrier
+                #   에러가 됨 (batch_size_labeled 작을수록 valid pair 없는 rank 확률↑ → 발현).
+                #   valid pair 없으면 0.0 default.
+                if getattr(weak_sup_cfg, "log_pair_stats", False):
+                    pair_sim_mean_val = (
+                        pair_stat_acc["pair_sim_mean"] / n_stat if n_stat > 0 else 0.0
+                    )
+                    loss_dict["pair_sim_max"] = torch.as_tensor(
+                        pair_stat_acc["pair_sim_max"], device=stu_patches.device
+                    )
+                    loss_dict["pair_sim_mean"] = torch.as_tensor(
+                        pair_sim_mean_val, device=stu_patches.device
+                    )
             except Exception as e:
                 logger.error(f"[weak_sup] forward_backward error: {e}")
                 raise
