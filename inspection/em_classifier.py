@@ -21,10 +21,17 @@
 
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import List, Optional, Sequence
 
 import numpy as np
+
+# dinov3(백본) + inspection 패키지 import 경로 보정 (repo 루트 / dino_v3)
+_REPO = Path(__file__).resolve().parents[1]
+for _p in (str(_REPO), str(_REPO / "dino_v3")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 logger = logging.getLogger("em_classifier")
 
@@ -189,7 +196,7 @@ class EMFeatureExtractor:
         return self.model.embed_dim
 
     def _transform(self):
-        from dinov3.eval.em_aug import build_em_eval_transform
+        from inspection.em_aug import build_em_eval_transform
 
         return build_em_eval_transform(self.image_size)
 
@@ -399,7 +406,7 @@ def fit_from_imagefolder(extractor: EMFeatureExtractor, data_root: str, kind: st
     import torch
     from torchvision import datasets
 
-    from dinov3.eval.fewshot_separability import extract_features
+    from inspection.fewshot_separability import extract_features
 
     dataset = datasets.ImageFolder(data_root, transform=extractor._transform())
     loader = torch.utils.data.DataLoader(

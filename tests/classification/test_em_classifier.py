@@ -10,7 +10,7 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from dinov3.eval.em_classifier import ClassifierHead, DefectRegistry, _softmax, pool_tokens  # noqa: E402
+from inspection.em_classifier import ClassifierHead, DefectRegistry, _softmax, pool_tokens  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +226,7 @@ def test_end_to_end_fit_save_load_predict(tmp_path):
     from PIL import Image
     from torchvision import datasets
 
-    from dinov3.eval.em_classifier import EMClassifier, EMFeatureExtractor, fit_from_imagefolder
+    from inspection.em_classifier import EMClassifier, EMFeatureExtractor, fit_from_imagefolder
 
     config = os.environ["EM_TEST_CONFIG"]
     ckpt = os.environ["EM_TEST_CKPT"]

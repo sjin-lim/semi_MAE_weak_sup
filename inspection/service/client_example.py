@@ -23,14 +23,14 @@ from pathlib import Path
 
 import numpy as np
 
-# dinov3.eval.em_classifier 의 torch-free 부분(ClassifierHead/DefectRegistry)만 사용
+# inspection.em_classifier 의 torch-free 부분(ClassifierHead/DefectRegistry)만 사용
 _HERE = Path(__file__).resolve()
-_REPO = _HERE.parents[1]
+_REPO = _HERE.parents[2]
 for p in (str(_REPO), str(_REPO / "dino_v3")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from dinov3.eval.em_classifier import ClassifierHead, DefectRegistry  # noqa: E402
+from inspection.em_classifier import ClassifierHead, DefectRegistry  # noqa: E402
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 

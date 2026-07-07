@@ -16,4 +16,4 @@ export EM_PORT="${EM_PORT:-8000}"
 export EM_HOST="${EM_HOST:-0.0.0.0}"
 export EM_CACHE_DIR="${EM_CACHE_DIR:-./.em_cache}"
 
-python service/feature_service.py "$@"
+python inspection/service/feature_service.py "$@"

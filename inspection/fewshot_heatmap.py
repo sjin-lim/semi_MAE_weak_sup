@@ -16,9 +16,8 @@
 #   영향 없음 → heatmap 에서는 무시한다 (상대 분포만 본다).
 #
 # 실행 (서버):
-#   cd dino_v3
-#   python dinov3/eval/fewshot_heatmap.py \
-#       --config-file dinov3/configs/train/weaksup/stage2_ssl_weaksup.yaml \
+#   python inspection/fewshot_heatmap.py \
+#       --config-file dino_v3/dinov3/configs/train/weaksup/stage2_ssl_weaksup.yaml \
 #       --pretrained-weights /path/to/teacher_checkpoint.pth \
 #       --data-root /path/to/class_folders \
 #       --per-class 4 \
@@ -36,14 +35,15 @@ from PIL import Image
 from torchvision import datasets
 
 _THIS = Path(__file__).resolve()
-_DINOV3_ROOT = _THIS.parents[2]
-if str(_DINOV3_ROOT) not in sys.path:
-    sys.path.insert(0, str(_DINOV3_ROOT))
+_REPO = _THIS.parents[1]  # repo 루트 (inspection/ 상위)
+for _p in (str(_REPO), str(_REPO / "dino_v3")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import dinov3.distributed as distributed  # noqa: E402
 from dinov3.eval.setup import setup_and_build_model  # noqa: E402
-from dinov3.eval.em_aug import build_em_eval_transform  # noqa: E402
-from dinov3.eval.fewshot_separability import extract_features  # noqa: E402
+from inspection.em_aug import build_em_eval_transform  # noqa: E402
+from inspection.fewshot_separability import extract_features  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("heatmap")

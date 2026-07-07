@@ -31,7 +31,7 @@ EXTRA=()
 if [[ -n "${SHOTS}" ]]; then EXTRA+=(--shots "${SHOTS}"); fi
 if [[ "${TRAIN_AUG}" == "1" ]]; then EXTRA+=(--train-aug --aug-views "${AUG_VIEWS}" --crop-scale "${CROP_SCALE}"); fi
 
-python dino_v3/dinov3/eval/fewshot_separability.py \
+python inspection/fewshot_separability.py \
     --config-file "${CONFIG}" \
     --pretrained-weights "${WEIGHTS}" \
     --data-root "${DATA_ROOT}" \

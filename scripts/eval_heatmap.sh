@@ -20,7 +20,7 @@ MODE="${MODE:-contrastive}"        # contrastive | raw
 EXTRA=()
 if [[ -n "${QUERY_DIR}" ]]; then EXTRA+=(--query-dir "${QUERY_DIR}"); fi
 
-python dino_v3/dinov3/eval/fewshot_heatmap.py \
+python inspection/fewshot_heatmap.py \
     --config-file "${CONFIG}" \
     --pretrained-weights "${WEIGHTS}" \
     --data-root "${DATA_ROOT}" \

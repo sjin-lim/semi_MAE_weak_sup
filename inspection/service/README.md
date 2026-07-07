@@ -60,16 +60,16 @@ curl -F images=@a.png -F images=@b.png "http://localhost:8000/features?feature_k
 
 ## 클라이언트에서 분류/등록 (torch-free)
 
-`service/client_example.py` — numpy + PIL(+requests/urllib) 만 필요.
+`inspection/service/client_example.py` — numpy + PIL(+requests/urllib) 만 필요.
 
 ```bash
 # 1) 클래스별 폴더 → 서버 embedding 수집 → registry/head 구성 (백본 없이 클라에서 완결)
-python service/client_example.py train --server http://SERVER:8000 \
+python inspection/service/client_example.py train --server http://SERVER:8000 \
     --data-root /path/to/class_folders --out registry.npz --clf logreg
 #   → registry.npz + registry_head.npz 생성
 
 # 2) 새 이미지 분류
-python service/client_example.py classify --server http://SERVER:8000 \
+python inspection/service/client_example.py classify --server http://SERVER:8000 \
     --input query_or_dir --head registry_head.npz --topk 3
 ```
 

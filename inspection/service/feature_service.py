@@ -27,9 +27,9 @@ import sys
 import threading
 from pathlib import Path
 
-# repo 루트 + dino_v3 를 path 에 (service/ 위치)
+# repo 루트 + dino_v3 를 path 에 (inspection/service/ 위치)
 _HERE = Path(__file__).resolve()
-_REPO = _HERE.parents[1]
+_REPO = _HERE.parents[2]
 for p in (str(_REPO), str(_REPO / "dino_v3")):
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -37,7 +37,7 @@ for p in (str(_REPO), str(_REPO / "dino_v3")):
 from flask import Flask, jsonify, request  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from dinov3.eval.em_classifier import FEATURE_KINDS, EMFeatureExtractor  # noqa: E402
+from inspection.em_classifier import FEATURE_KINDS, EMFeatureExtractor  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("feature_service")
