@@ -1,0 +1,220 @@
+# ============================================================
+# semi_MAE — DINOv3 ViT-L Foundation (pretrain + v7 병합, 3-stage용)
+#
+# 4단계(pretrain→v7→semi-sup→hires)를 3단계로 축약:
+#   ① 이 Foundation(L)  ② semi-sup(stage2 L)  ③ hires(stage3 L)
+#
+# 병합 내용:
+#   - pretrain 코어: DINO 공개 L weight init + 장기 SSL 도메인 적응
+#   - v7 개선: 랜덤 마스킹(info-aware off, boundary 표현↑) + iBOT loss 1.5
+#   - "지금까지 배운 aug"를 처음부터:
+#       · gamma OFF (절대레벨 invariance = 물질 분리 해침 → 폐기)
+#       · disk_blur 약화 (경계 흐림 악화 방지)
+#       · wave_aug ON (반사 ripple invariance — 16만장 전체에 처음부터 학습)
+#
+# ⚠️ trade-off: B 는 mask 0.3→0.5 커리큘럼(2단계)이었으나 단일 스테이지라
+#    고정 mask 0.1–0.4 로 타협 (0.3보다 boundary↑, 0.5보단 초반 noise-학습 안전).
+#    완전 0.5 원하면 4단계(pretrain→v7) 유지.
+#
+# 출발점: DINO 공개 ViT-L weight (student.pretrained_weights).
+# ⚠️ 메모리: batch 128 OOM 이면 64 + OFFICIAL_EPOCH_LENGTH 2배(2500).
+#
+# 실행:
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_vitL_foundation.yaml \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       student.pretrained_weights=/path/to/dinov3_public_vitL.pth \
+#       train.output_dir=/path/to/output_vitL_foundation
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  loss_weight: 1.5                    # v7: iBOT 강화
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.4                            # 병합 타협 (pretrain 0.3 / v7 0.5 사이)
+  mask_random_circular_shift: false
+  information_aware_masking: false    # v7 핵심: 랜덤 마스킹 → boundary 표현 강화
+  masking_temperature: 0.5
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048
+
+gram:
+  use_loss: false
+  compute_stats: false
+  loss_weight: 0.0
+  ema_teacher: false
+  ckpt: null
+  it_load_ema_teacher: -1
+  rep_update: false
+  update_frequency: 10000
+  it_first_update: 999999999
+  max_updates: 0
+  normalized: true
+  img_level: true
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./output_dino_em_vitL_foundation"
+
+  batch_size_per_gpu: 128            # OOM 시 64 + OFFICIAL_EPOCH_LENGTH 2500
+  num_workers: 10
+  seed: 0
+  OFFICIAL_EPOCH_LENGTH: 1250        # pretrain 회계 (schedule 전용)
+
+  saveckp_freq: 20
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_large                    # ← ViT-L
+  patch_size: 16
+  # DINO 공개 ViT-L weight 경로. arch 파라미터(n_storage_tokens/ffn_layer/qkv_bias/
+  # rope)가 공개 weight 와 일치해야 init 이 전이됨.
+  pretrained_weights: ''
+  resume_from_teacher_chkpt: ''
+  drop_path_rate: 0.1               # pretrained init → 약한 regularization
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.994             # from-init → 초반 teacher 이동 허용
+  final_momentum_teacher: 0.9999
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 10
+
+optim:
+  epochs: 120                         # pretrain(장기) + v7(refine) 병합 ≈ 150k step
+  optimizer: adamw
+  weight_decay: 0.04                  # 초반 낮게 (pretrained feature 보호)
+  weight_decay_end: 0.1
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 1
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 0.9
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 224
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  local_crops_number: 8
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: false
+  intensity_aug:
+    # 지금까지 배운 aug (stage2 철학): gamma/CLAHE off, blur 약화.
+    clahe_p: 0.0
+    gamma_p: 0.0
+    poisson_p: 0.3
+    disk_blur_p_global1: 0.1
+    disk_blur_p_global2: 0.0
+    disk_blur_p_local: 0.1
+  wave_aug:
+    # 반사(ripple) invariance — foundation 부터 16만장 전체에 학습
+    enabled: true
+    k_lo: 0.001
+    k_hi: 0.0031
+    amp: 0.12
+    direction: null
+    dir_width: 30.0
+    p: 0.5
+    amp_jitter: true
+    mode: mult
+    spatial_envelope_p: 0.3
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  period: 3750
+  max_to_keep: 8
+  keep_every: 99999999999999
+
+evaluation:
+  eval_period_iterations: 6250        # ≈ 5 epoch(1250)마다 teacher checkpoint 저장
+
+schedules:
+  weight_decay:
+    start: 0.04
+    peak: 0.04
+    end: 0.1
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.04
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 10
+  lr:
+    start: 0
+    # pretrain(2e-4 도메인적응)과 v7(1e-4 refine)의 중간. warmup 10 으로 초반 안정.
+    peak: 0.00015
+    end: 1.0e-06
+    warmup_epochs: 10
+    freeze_last_layer_epochs: 1
+    cosine_epochs: 110
+  momentum:
+    start: 0.994
+    peak: 0.994
+    end: 0.9999
+    warmup_epochs: 0
