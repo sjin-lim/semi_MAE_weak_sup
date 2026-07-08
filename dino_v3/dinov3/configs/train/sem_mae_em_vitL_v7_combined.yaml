@@ -1,0 +1,205 @@
+# ============================================================
+# semi_MAE — DINOv3 ViT-L v7 Combined (semi-sup 이전 최종 foundation)
+#
+# sem_mae_em_vitb_v7_combined.yaml(ViT-B)의 ViT-L 판. B→L 변경 (최소):
+#   - student.arch  vit_base → vit_large
+#   - dino/ibot head_hidden_dim 1024 → 2048, dino head_n_prototypes 32768 → 65536
+#     (pretrain-L 헤드와 일치 → resume 시 head weight 전이)
+#   - 그 외(CLAHE off·랜덤 마스킹·iBOT 1.5·mask 0.5·refined aug·LR 1e-4·60ep) 동일
+#
+# ★ v7 은 iBOT 강화(loss 1.5, mask 0.1–0.5)를 이미 내장 → 별도 ibot_ft 단계 생략 가능.
+#   권장 체인: pretrain(L) → 이 v7(L) → semi-sup(stage2 L) → hires(stage3 L).
+#
+# 출발점(resume):
+#   - 기본: pretrain(L) teacher checkpoint (ibot_ft 생략).
+#   - full chain 원하면: ibot_ft(L) teacher 에서 resume 도 가능.
+#
+# ⚠️ 메모리: ViT-L 은 ~3.5× 파라미터. batch 128 OOM 이면 64 로 낮추고
+#    OFFICIAL_EPOCH_LENGTH 를 2배(640)로 올려 총 이미지 노출 유지.
+#
+# 실행:
+#   python dinov3/train/train.py \
+#       --config-file dinov3/configs/train/sem_mae_em_vitL_v7_combined.yaml \
+#       --no-resume \
+#       train.dataset_path="WebDataset:path=/path/to/shards" \
+#       student.resume_from_teacher_chkpt=/path/to/vitL_pretrain/.../teacher_checkpoint.pth \
+#       train.output_dir=/path/to/output_vitL_v7_combined
+# ============================================================
+
+MODEL:
+  META_ARCHITECTURE: SSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 65536            # L: 32768 → 65536 (pretrain-L 과 일치)
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048             # L: 1024 → 2048
+  koleo_loss_weight: 0.1
+  koleo_loss_distributed: false
+  koleo_topk: 1
+
+ibot:
+  loss_weight: 1.5
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+    - 0.1
+    - 0.5
+  mask_random_circular_shift: false
+  # 랜덤 마스킹 (v7 핵심): boundary 패치도 균등 마스킹 → boundary 표현 강화
+  information_aware_masking: false
+  masking_temperature: 0.5
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 32768
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048             # L: 1024 → 2048
+
+gram:
+  use_loss: false
+  compute_stats: false
+  loss_weight: 0.0
+  ema_teacher: false
+  ckpt: null
+  it_load_ema_teacher: -1
+  rep_update: false
+  update_frequency: 10000
+  it_first_update: 999999999
+  max_updates: 0
+  normalized: true
+  img_level: true
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+
+train:
+  dataset_path: "WebDataset:path=<FILL_IN>/shards"
+  output_dir: "./output_dino_em_vitL_v7_combined"
+
+  batch_size_per_gpu: 128            # OOM 시 64 + OFFICIAL_EPOCH_LENGTH 640
+  num_workers: 10
+  seed: 0
+  OFFICIAL_EPOCH_LENGTH: 320
+
+  saveckp_freq: 20
+  cache_dataset: false
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  centering: sinkhorn_knopp
+
+student:
+  arch: vit_large                    # ← B→L 핵심
+  patch_size: 16
+  pretrained_weights: ''
+  resume_from_teacher_chkpt: ''      # CLI override (pretrain-L teacher)
+  drop_path_rate: 0.2
+  layerscale: 1.0e-05
+  drop_path_uniform: true
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  in_chans: 3
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_rescale_coords: 2
+
+teacher:
+  momentum_teacher: 0.998
+  final_momentum_teacher: 0.9999
+  warmup_teacher_temp: 0.07
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0
+
+optim:
+  epochs: 60
+  optimizer: adamw
+  weight_decay: 0.15
+  weight_decay_end: 0.15
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0
+  scaling_rule: sqrt_wrt_1024
+  layerwise_decay: 0.9
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+
+crops:
+  global_crops_size: 448
+  local_crops_size: 224
+  global_crops_scale:
+    - 0.32
+    - 1.0
+  local_crops_scale:
+    - 0.05
+    - 0.32
+  local_crops_number: 8
+  horizontal_flips: true
+  share_color_jitter: false
+  instance_norm: true
+  clahe: false
+  intensity_aug:
+    clahe_p: 0.0
+    gamma_p: 0.5
+    poisson_p: 0.3
+    disk_blur_p_global1: 0.3
+    disk_blur_p_global2: 0.05
+    disk_blur_p_local: 0.2
+  rgb_mean:
+    - 0.485
+    - 0.456
+    - 0.406
+  rgb_std:
+    - 0.229
+    - 0.224
+    - 0.225
+
+checkpointing:
+  period: 2400
+  max_to_keep: 8
+  keep_every: 99999999999999
+
+evaluation:
+  eval_period_iterations: 3200
+
+schedules:
+  weight_decay:
+    start: 0.15
+    peak: 0.15
+    end: 0.15
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.07
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 0
+  lr:
+    start: 0
+    # v7: CLAHE invariance 해제 + 랜덤 마스킹 재학습 → peak 1e-4 (ibot_ft 5e-5 보다 높게)
+    peak: 0.0001
+    end: 1.0e-06
+    warmup_epochs: 5
+    freeze_last_layer_epochs: 0
+    cosine_epochs: 55
+  momentum:
+    start: 0.998
+    peak: 0.998
+    end: 0.9999
+    warmup_epochs: 0
