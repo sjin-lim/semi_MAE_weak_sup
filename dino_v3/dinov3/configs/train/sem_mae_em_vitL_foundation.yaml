@@ -122,6 +122,14 @@ student:
   norm_layer: layernormbf16
   n_storage_tokens: 4
   mask_k_bias: true
+  # ── DINOv3 공식 ViT-L(lvd1689m) RoPE — 공개 weight 와 일치 필수 ──
+  # 기본 rope 를 쓰면 위치인코딩 불일치로 iBOT 가 학습 안 됨 → ropenew.
+  pos_embed_type: ropenew
+  pos_embed_grid_size: 48
+  pos_embed_rope_base: 100
+  pos_embed_rope_normalize_coords: separate
+  pos_embed_rope_dtype: bf16
+  pos_embed_rope_gamma: 1.0
   pos_embed_rope_rescale_coords: 2
 
 teacher:
