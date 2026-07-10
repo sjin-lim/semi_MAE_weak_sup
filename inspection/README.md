@@ -1,5 +1,7 @@
 # DINO feature 분리도 / few-shot 진단
 
+> 📌 전체 사용법 진입점은 **[USAGE.md](USAGE.md)** (Quickstart). 이 문서는 분리도/분류 도구 상세.
+
 학습된 DINOv3(teacher) backbone 의 frozen feature 가 **폴더로 구분한 클래스**를
 얼마나 잘 분리하는지 빠르게 검사하는 도구. 분산(distributed) 없이 **단일 GPU** 로 동작.
 
