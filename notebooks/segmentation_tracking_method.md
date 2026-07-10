@@ -34,6 +34,16 @@ PIL RGB
 - **L2 정규화**: 이후 내적 = **코사인 유사도**. feature 크기가 아니라 방향(패턴)만 비교.
 - 해상도 예: 960×1280 입력 → **60×80 feature grid**. 여기가 propagation 이 도는 "작업 해상도".
 
+### intensity 채널 보강 (`INTENSITY_WEIGHT`)
+
+**문제**: `PerImageNormalize` + DINO semantic feature 는 밝기/조명에 둔감하도록 설계됨. 그런데
+액체 확산의 경계는 **미세한 밝기차**라, 정작 필요한 신호가 feature 에 약하게만 실린다. 그 결과
+확산 front 가 기존 영역과 밝기만 조금 달라도 매칭에서 배경으로 넘어가 **front 가 선택 안 되는** 문제.
+
+**해결**: `forward()` 에서 DINO feature `[h,w,D]` 에 **patch 별 평균 밝기 채널**을 concat 한 뒤 다시
+L2 정규화 → 코사인 유사도가 밝기차를 반영. `INTENSITY_WEIGHT` 로 semantic 대비 밝기 비중 조절
+(0=끔, 0.3~1.0 권장). 학습 불필요. 모든 프레임이 동일 `forward` 를 타므로 context/current 일관.
+
 ## 2. 첫 프레임 준비 (seed)
 
 - **첫 마스크 PNG** (0=배경, 1,2,…=객체) 를 사람이 제공 → "무엇을 추적할지"의 정의.
