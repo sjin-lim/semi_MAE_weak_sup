@@ -83,6 +83,8 @@ python inspection/service/client_example.py classify --server http://localhost:8
 ### F. 노트북 (tests/classification/)
 - `em_classification_demo.ipynb` — **direct** 모드(백본 직접). torch+GPU.
 - `em_classification_service_demo.ipynb` — **service** 모드(torch-free). 서버 기동 필요.
+- `head_comparison_demo.ipynb` — **NCM/kNN/logreg/Tip-Adapter 비교 + β 스윕 + t-SNE**
+  (service 기반, torch-free). 헤드 선택 테스트에 사용.
 - 설정 셀 경로만 채우고 위에서부터 실행.
 
 ### G. 단위 테스트
