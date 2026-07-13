@@ -328,9 +328,18 @@ def init_fsdp_model_from_checkpoint(
             )
         else:
             world_mesh = DeviceMesh.from_group(process_group, "cuda")
+        # src_data_rank 는 최신 PyTorch(2.5+) 에서 추가된 인자 — 낮은 torch 는 미지원.
+        # 각 rank 가 동일한 CPU 체크포인트를 로드하므로 없어도 결과 동일(기본 scatter-from-0).
+        import inspect as _inspect
+        _distribute_tensor = torch.distributed.tensor.distribute_tensor
+        _dt_kwargs = (
+            {"src_data_rank": None}
+            if "src_data_rank" in _inspect.signature(_distribute_tensor).parameters
+            else {}
+        )
         chkpt = {
             key: (
-                torch.distributed.tensor.distribute_tensor(tensor, world_mesh, src_data_rank=None)
+                _distribute_tensor(tensor, world_mesh, **_dt_kwargs)
                 if not any(key_not_sharded in key for key_not_sharded in keys_not_sharded)
                 else tensor
             )
