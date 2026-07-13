@@ -10,7 +10,9 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from inspection.em_classifier import ClassifierHead, DefectRegistry, _softmax, pool_tokens  # noqa: E402
+from inspection.em_classifier import (  # noqa: E402
+    ClassifierHead, DefectRegistry, TipAdapterHead, _softmax, load_head, pool_tokens,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -181,6 +183,81 @@ def test_registry_single_class_falls_back_to_ncm():
     reg.enroll("only", _feats(0))
     head = reg.build_head(kind="logreg")   # 1클래스 → ncm 폴백
     assert head.num_classes == 1
+
+
+# --------------------------------------------------------------------------- #
+# TipAdapterHead (training-free) — 순수 numpy
+# --------------------------------------------------------------------------- #
+def _bimodal(num_classes=3, per_class=30, dim=16, seed=0):
+    """클래스별 단봉(unimodal) 합성 — 기본 검증용."""
+    return _synthetic(num_classes, per_class, dim, seed)
+
+
+def test_tip_fit_predict_separable():
+    X, y, names = _synthetic()
+    head = TipAdapterHead.fit(X, y, names, beta=5.5)
+    assert head.num_classes == 3 and head.feature_dim == X.shape[1]
+    assert (head.predict(X) == y).mean() > 0.95
+
+
+def test_tip_proba_valid():
+    X, y, names = _synthetic()
+    head = TipAdapterHead.fit(X, y, names)
+    proba = head.predict_proba(X)
+    assert proba.shape == (len(X), 3)
+    assert np.allclose(proba.sum(axis=1), 1.0)
+    assert (proba >= 0).all()
+
+
+def test_tip_beats_ncm_on_multimodal():
+    """한 클래스가 두 군집으로 갈리면 NCM 평균은 엉뚱한 곳 → tip 이 이긴다."""
+    rng = np.random.default_rng(0)
+    dim = 16
+    e0 = np.eye(1, dim, 0, dtype=np.float32)[0]
+    e1 = np.eye(1, dim, 1, dtype=np.float32)[0]
+    mid = (e0 + e1) / np.sqrt(2.0)  # A 두 군집의 "평균 방향" = B 위치
+
+    def cluster(center, n):
+        p = center + 0.08 * rng.standard_normal((n, dim)).astype(np.float32)
+        return p / (np.linalg.norm(p, axis=1, keepdims=True) + 1e-8)
+
+    # 클래스 A = {e0 군집, e1 군집}(bimodal), 클래스 B = mid 군집
+    XA = np.concatenate([cluster(e0, 40), cluster(e1, 40)])
+    XB = cluster(mid, 40)
+    X = np.concatenate([XA, XB]); y = np.concatenate([np.zeros(80), np.ones(40)]).astype(int)
+    names = ["A", "B"]
+    # 테스트: A 두 군집 + B
+    tXA = np.concatenate([cluster(e0, 20), cluster(e1, 20)]); tXB = cluster(mid, 20)
+    tX = np.concatenate([tXA, tXB]); ty = np.concatenate([np.zeros(40), np.ones(20)]).astype(int)
+
+    ncm = ClassifierHead.fit(X, y, names, kind="ncm")
+    tip = TipAdapterHead.fit(X, y, names, beta=8.0)
+    ncm_acc = (ncm.predict(tX) == ty).mean()
+    tip_acc = (tip.predict(tX) == ty).mean()
+    assert tip_acc > ncm_acc, f"tip({tip_acc:.2f}) 이 ncm({ncm_acc:.2f}) 보다 나아야 (multimodal)"
+    assert tip_acc > 0.9
+
+
+def test_tip_save_load_and_dispatch(tmp_path):
+    X, y, names = _synthetic()
+    head = TipAdapterHead.fit(X, y, names, beta=6.0, balanced=True, meta={"feature_kind": "concat"})
+    path = head.save(str(tmp_path / "tip"))
+    assert path.endswith(".npz")
+    loaded = load_head(path)                      # dispatch → TipAdapterHead
+    assert isinstance(loaded, TipAdapterHead)
+    assert loaded.beta == 6.0 and loaded.class_names == names
+    assert np.array_equal(loaded.predict(X), head.predict(X))
+    # ncm/logreg 아티팩트는 여전히 ClassifierHead 로 로드
+    ch = ClassifierHead.fit(X, y, names, kind="ncm").save(str(tmp_path / "ncm"))
+    assert isinstance(load_head(ch), ClassifierHead)
+
+
+def test_registry_build_head_tip():
+    reg = DefectRegistry()
+    reg.enroll("a", _feats(0)); reg.enroll("b", _feats(1))
+    head = reg.build_head(kind="tip", beta=5.5)
+    assert isinstance(head, TipAdapterHead)
+    assert (head.predict(_feats(0)) == head.class_names.index("a")).mean() > 0.9
 
 
 # --------------------------------------------------------------------------- #

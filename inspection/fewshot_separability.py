@@ -103,9 +103,11 @@ def ncm_predict(train_x, train_y, test_x, num_classes):
     return sims.argmax(axis=1)
 
 
-def run_episode(train_x, train_y, test_x, test_y, num_classes, knn_k):
+def run_episode(train_x, train_y, test_x, test_y, num_classes, knn_k, tip_beta=5.5):
     from sklearn.linear_model import LogisticRegression
     from sklearn.neighbors import KNeighborsClassifier
+
+    from inspection.em_classifier import TipAdapterHead
 
     res = {}
     # NCM
@@ -123,6 +125,9 @@ def run_episode(train_x, train_y, test_x, test_y, num_classes, knn_k):
     res["logreg"] = float((pred_lr == test_y).mean())
     res["_logreg_pred"] = pred_lr
     res["_logreg_test_y"] = test_y
+    # Tip-Adapter (training-free)
+    th = TipAdapterHead.fit(train_x, train_y, [str(c) for c in range(num_classes)], beta=tip_beta)
+    res["tip"] = float((th.predict(test_x) == test_y).mean())
     return res
 
 
@@ -214,6 +219,7 @@ def main():
     ap.add_argument("--n-tries", type=int, default=5, help="에피소드 반복 수 (평균±std)")
     ap.add_argument("--test-frac", type=float, default=0.5, help="shots 미지정 시 test 비율")
     ap.add_argument("--knn-k", type=int, default=5)
+    ap.add_argument("--tip-beta", type=float, default=5.5, help="Tip-Adapter 커널 sharpness")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--output-dir", default="./output_separability")
@@ -289,7 +295,7 @@ def main():
 
     # 5) 에피소드 평가
     rng = np.random.default_rng(args.seed)
-    keys = ["ncm", "knn", "logreg"]
+    keys = ["ncm", "knn", "logreg", "tip"]
     scores = {k: [] for k in keys}
     last = None
     for t in range(args.n_tries):
@@ -307,7 +313,7 @@ def main():
             train_y = np.tile(y[tr], args.aug_views + 1)
         else:
             train_x, train_y = x[tr], y[tr]
-        r = run_episode(train_x, train_y, x[te], y[te], num_classes, args.knn_k)
+        r = run_episode(train_x, train_y, x[te], y[te], num_classes, args.knn_k, tip_beta=args.tip_beta)
         for k in keys:
             scores[k].append(r[k])
         last = r

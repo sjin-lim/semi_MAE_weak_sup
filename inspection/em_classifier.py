@@ -138,6 +138,99 @@ class ClassifierHead:
         return cls(npz["W"], npz["bias"], list(npz["class_names"]), meta)
 
 
+def _l2norm(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32)
+    return X / (np.linalg.norm(X, axis=-1, keepdims=True) + 1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# 1b) Tip-Adapter head (training-free, vision-only) — 캐시 커널 soft-kNN
+# --------------------------------------------------------------------------- #
+class TipAdapterHead:
+    """training-free Tip-Adapter (CLIP 텍스트 브랜치 없이).
+
+    support feature 를 key, one-hot 라벨을 value 로 하는 비모수 캐시 모델.
+      sim   = x · key_i                      (cosine, feature/key 모두 L2 정규화)
+      aff_i = exp(beta * (sim - 1))          (Tip-Adapter 커널; sim=1→1, 멀수록 0)
+      score[c] = Σ_{label_i=c} aff_i · v_i    (v_i = balanced 시 1/클래스수, 아니면 1)
+    predict = argmax_c score[c]. 학습 없음 → 증분 추가(키 append) 즉시 반영, multi-modal 강건.
+
+    ClassifierHead 와 동일한 인터페이스(predict/predict_proba/save/load)를 제공(drop-in).
+    """
+
+    def __init__(self, keys: np.ndarray, labels: np.ndarray, class_names: Sequence[str],
+                 beta: float = 5.5, balanced: bool = True, meta: Optional[dict] = None):
+        self.keys = _l2norm(keys)                       # [N, D]
+        self.labels = np.asarray(labels).astype(int)    # [N]
+        self.class_names = list(class_names)
+        self.beta = float(beta)
+        self.balanced = bool(balanced)
+        self.meta = dict(meta or {})
+        C = len(self.class_names)
+        assert self.keys.shape[0] == len(self.labels) and C >= 1
+        vals = np.zeros((len(self.labels), C), dtype=np.float32)
+        vals[np.arange(len(self.labels)), self.labels] = 1.0
+        if balanced:  # 클래스별 총 mass 를 1 로 → support 수 불균형 보정
+            vals = vals / np.clip(vals.sum(axis=0, keepdims=True), 1.0, None)
+        self.values = vals
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_names)
+
+    @property
+    def feature_dim(self) -> int:
+        return self.keys.shape[1]
+
+    @classmethod
+    def fit(cls, X: np.ndarray, y: np.ndarray, class_names: Sequence[str],
+            beta: float = 5.5, balanced: bool = True, meta: Optional[dict] = None) -> "TipAdapterHead":
+        meta = dict(meta or {})
+        meta.update({"clf_kind": "tip", "beta": float(beta), "balanced": bool(balanced)})
+        return cls(X, y, class_names, beta=beta, balanced=balanced, meta=meta)
+
+    def decision(self, X: np.ndarray) -> np.ndarray:
+        X = _l2norm(np.atleast_2d(X))
+        aff = np.exp(self.beta * (X @ self.keys.T - 1.0))   # [M, N]
+        return aff @ self.values                             # [M, C]
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return self.decision(X).argmax(axis=1)
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        s = self.decision(X)
+        return s / (s.sum(axis=1, keepdims=True) + 1e-12)   # 유사도 mass 정규화
+
+    def save(self, path: str) -> str:
+        path = str(path)
+        if not path.endswith(".npz"):
+            path += ".npz"
+        meta = dict(self.meta)
+        meta.update({"_artifact_version": ARTIFACT_VERSION, "clf_kind": "tip",
+                     "beta": self.beta, "balanced": self.balanced})
+        np.savez(path, keys=self.keys, labels=self.labels,
+                 class_names=np.array(self.class_names, dtype=object),
+                 meta=json.dumps(meta, ensure_ascii=False))
+        logger.info(f"Tip-Adapter head 저장: {path} (N={len(self.labels)}, C={self.num_classes})")
+        return path
+
+    @classmethod
+    def load(cls, path: str) -> "TipAdapterHead":
+        npz = np.load(path, allow_pickle=True)
+        meta = json.loads(str(npz["meta"]))
+        return cls(npz["keys"], npz["labels"], list(npz["class_names"]),
+                   beta=meta.get("beta", 5.5), balanced=meta.get("balanced", True), meta=meta)
+
+
+def load_head(path: str):
+    """아티팩트를 clf_kind 에 맞춰 로드 (ClassifierHead | TipAdapterHead)."""
+    npz = np.load(path, allow_pickle=True)
+    meta = json.loads(str(npz["meta"]))
+    if meta.get("clf_kind") == "tip":
+        return TipAdapterHead.load(path)
+    return ClassifierHead.load(path)
+
+
 # --------------------------------------------------------------------------- #
 # 2) feature pooling (학습과 동일 규약) — torch 텐서 입력
 # --------------------------------------------------------------------------- #
@@ -247,7 +340,7 @@ class EMClassifier:
     def from_artifact(cls, artifact_path: str, config_file: Optional[str] = None,
                       pretrained_weights: Optional[str] = None, cache_dir: str = "./.em_cache") -> "EMClassifier":
         """헤드 아티팩트 로드 + 백본 구성 (경로는 아티팩트 meta 에서, 필요 시 override)."""
-        head = ClassifierHead.load(artifact_path)
+        head = load_head(artifact_path)  # ClassifierHead | TipAdapterHead
         m = head.meta
         extractor = EMFeatureExtractor(
             config_file=config_file or m["config_file"],
@@ -260,11 +353,12 @@ class EMClassifier:
         return cls(extractor, head)
 
     @classmethod
-    def from_registry(cls, registry_path: str, kind: str = "logreg", config_file: Optional[str] = None,
+    def from_registry(cls, registry_path: str, kind: str = "logreg", beta: float = 5.5,
+                      config_file: Optional[str] = None,
                       pretrained_weights: Optional[str] = None, cache_dir: str = "./.em_cache") -> "EMClassifier":
         """DefectRegistry 로드 → 헤드 재구성 + 백본 구성. 증분 추가된 불량 반영."""
         reg = DefectRegistry.load(registry_path)
-        head = reg.build_head(kind=kind)
+        head = reg.build_head(kind=kind, beta=beta)
         m = reg.meta
         extractor = EMFeatureExtractor(
             config_file=config_file or m["config_file"],
@@ -337,13 +431,15 @@ class DefectRegistry:
         self.features.pop(name, None)
         return self
 
-    def build_head(self, kind: str = "logreg") -> ClassifierHead:
-        """현재 캐시로 헤드 재구성. 클래스 1개면 logreg 불가 → ncm 로 폴백."""
+    def build_head(self, kind: str = "logreg", beta: float = 5.5, balanced: bool = True):
+        """현재 캐시로 헤드 재구성. kind: logreg | ncm | tip. 클래스 1개면 logreg→ncm 폴백."""
         names = self.classes
         if len(names) == 0:
             raise ValueError("등록된 클래스가 없음")
         X = np.vstack([self.features[n] for n in names])
         y = np.concatenate([np.full(len(self.features[n]), i) for i, n in enumerate(names)])
+        if kind == "tip":
+            return TipAdapterHead.fit(X, y, names, beta=beta, balanced=balanced, meta=self.meta)
         if kind == "logreg" and len(names) < 2:
             kind = "ncm"
         return ClassifierHead.fit(X, y, names, kind=kind, meta=self.meta)
@@ -401,8 +497,8 @@ def enroll_dir(extractor: EMFeatureExtractor, registry: DefectRegistry, name: st
 # 6) 학습 편의 함수 + CLI
 # --------------------------------------------------------------------------- #
 def fit_from_imagefolder(extractor: EMFeatureExtractor, data_root: str, kind: str = "logreg",
-                         batch_size: int = 32, num_workers: int = 8) -> ClassifierHead:
-    """ImageFolder 전체로 헤드 학습. 백본 feature 추출 후 numpy 헤드 fit."""
+                         beta: float = 5.5, batch_size: int = 32, num_workers: int = 8):
+    """ImageFolder 전체로 헤드 학습. kind: logreg | ncm | tip. 백본 feature 추출 후 numpy 헤드 fit."""
     import torch
     from torchvision import datasets
 
@@ -421,6 +517,8 @@ def fit_from_imagefolder(extractor: EMFeatureExtractor, data_root: str, kind: st
         "config_file": str(Path(extractor.config_file).resolve()),
         "pretrained_weights": str(Path(extractor.pretrained_weights).resolve()),
     }
+    if kind == "tip":
+        return TipAdapterHead.fit(X, y, dataset.classes, beta=beta, meta=meta)
     return ClassifierHead.fit(X, y, dataset.classes, kind=kind, meta=meta)
 
 
@@ -429,7 +527,7 @@ def _cli_fit(args):
         args.config_file, args.pretrained_weights, image_size=args.image_size,
         n_blocks=args.n_blocks, feature_kind=args.feature, cache_dir=args.cache_dir,
     )
-    head = fit_from_imagefolder(extractor, args.data_root, kind=args.clf,
+    head = fit_from_imagefolder(extractor, args.data_root, kind=args.clf, beta=args.beta,
                                 batch_size=args.batch_size, num_workers=args.num_workers)
     out = head.save(args.out)
     print(f"저장됨: {out}  (classes={head.class_names})")
@@ -438,7 +536,7 @@ def _cli_fit(args):
 def _cli_predict(args):
     if args.registry:
         clf = EMClassifier.from_registry(
-            args.registry, kind=args.clf, config_file=args.config_file,
+            args.registry, kind=args.clf, beta=args.beta, config_file=args.config_file,
             pretrained_weights=args.pretrained_weights, cache_dir=args.cache_dir,
         )
     elif args.artifact:
@@ -512,7 +610,8 @@ def main(argv=None):
     f.add_argument("--pretrained-weights", required=True)
     f.add_argument("--data-root", required=True)
     f.add_argument("--out", required=True, help="저장 경로(.npz)")
-    f.add_argument("--clf", choices=["logreg", "ncm"], default="logreg")
+    f.add_argument("--clf", choices=["logreg", "ncm", "tip"], default="logreg")
+    f.add_argument("--beta", type=float, default=5.5, help="tip: Tip-Adapter 커널 sharpness")
     f.add_argument("--feature", choices=list(FEATURE_KINDS), default="concat")
     f.add_argument("--n-blocks", type=int, default=1)
     f.add_argument("--image-size", type=int, default=448)
@@ -524,7 +623,8 @@ def main(argv=None):
     p = sub.add_parser("predict", help="아티팩트/registry 로드 후 이미지/폴더 추론")
     p.add_argument("--artifact", default=None, help="헤드 아티팩트(.npz)")
     p.add_argument("--registry", default=None, help="불량 registry(.npz) — 지정 시 헤드 재구성")
-    p.add_argument("--clf", choices=["logreg", "ncm"], default="logreg", help="registry 추론 시 헤드 종류")
+    p.add_argument("--clf", choices=["logreg", "ncm", "tip"], default="logreg", help="registry 추론 시 헤드 종류")
+    p.add_argument("--beta", type=float, default=5.5, help="tip: Tip-Adapter 커널 sharpness")
     p.add_argument("--input", required=True, help="이미지 파일 또는 폴더")
     p.add_argument("--topk", type=int, default=3)
     p.add_argument("--config-file", default=None, help="백본 config override (기본: 아티팩트 meta)")

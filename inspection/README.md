@@ -100,7 +100,11 @@ python inspection/fewshot_separability.py \
 | `ncm` | Nearest Class Mean (학습 0) — feature 자체 분리도 sanity |
 | `knn` | kNN (학습 0) |
 | `logreg` | Logistic Regression — 10~50 shot 본 성능 |
+| `tip` | Tip-Adapter(training-free, 학습 0) — 캐시 커널 soft-kNN. **multi-modal 클래스에 강건** (`--tip-beta`) |
 | per-class / confusion | 어느 클래스끼리 섞이는지 |
+
+> 헤드 종류: `ncm`/`logreg`/`tip`. 한 클래스가 여러 하위 군집으로 갈리면 NCM 평균이 엉뚱한
+> 곳에 찍혀 무너지므로, 그런 경우 **tip**(또는 kNN)이 유리. CLI/서비스에서 `--clf tip` 로 선택.
 
 해석 가이드:
 - **inter-class cosine 낮고 NCM/logreg 높음** → DINO feature 가 이미 분리. 바로 few-shot 본선.

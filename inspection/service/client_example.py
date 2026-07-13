@@ -128,7 +128,7 @@ def cmd_train(args):
     reg_path = reg.save(args.out)
     print(f"registry 저장: {reg_path}  classes={reg.counts()}")
 
-    head = reg.build_head(kind=args.clf)
+    head = reg.build_head(kind=args.clf, beta=args.beta)
     head_path = head.save(args.head_out or (str(Path(args.out).with_suffix("")) + "_head.npz"))
     print(f"head 저장: {head_path}  (classify 에 --head 로 사용)")
 
@@ -149,7 +149,8 @@ def main():
     t.add_argument("--data-root", required=True, help="ImageFolder (클래스별 하위폴더)")
     t.add_argument("--out", required=True, help="registry 저장 경로(.npz)")
     t.add_argument("--head-out", default=None, help="head 저장 경로(기본: <out>_head.npz)")
-    t.add_argument("--clf", choices=["logreg", "ncm"], default="logreg")
+    t.add_argument("--clf", choices=["logreg", "ncm", "tip"], default="logreg")
+    t.add_argument("--beta", type=float, default=5.5, help="tip: Tip-Adapter 커널 sharpness")
     t.set_defaults(func=cmd_train)
 
     args = ap.parse_args()
