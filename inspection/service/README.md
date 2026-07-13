@@ -81,7 +81,8 @@ feature 규약(정규화·feature_kind·image_size)이 서버에서 오는 embed
 - **서버에서 분류까지 ((2) 구조)**: 이 서비스에 `EMClassifier`(백본+헤드) 를 얹어 `/predict`
   엔드포인트를 추가하면 된다. feature 추출부가 이미 분리돼 있어 얇은 래퍼로 충분.
 - **dense 분석**: 현재는 pooled embedding 만. patch 토큰 반환(`include=patch`)은 향후 확장.
-- **프로덕션**: GPU 모델 특성상 프로세스 1개가 낫다 → `gunicorn -w 1 --threads N feature_service:app`
-  (`service/` 에서 실행). 백본은 첫 요청 시 lazy 로드(`_ensure_loaded`)되어 gunicorn 에서도
-  별도 조정 없이 동작.
+- **프로덕션 WSGI**: 기본 **waitress**(순수 파이썬, Windows/리눅스 공용). `scripts/serve_features.sh`
+  가 `EM_SERVER=waitress`·`EM_THREADS=4`로 기동(미설치 시 Flask 개발 서버 폴백). GPU 모델이라
+  프로세스는 **1개**(백본 1회 로드), 동시 요청은 스레드로 받되 추론은 내부 `_LOCK`으로 직렬화.
+  (리눅스면 `gunicorn -w 1 --threads N feature_service:app` 도 가능 — lazy 로드라 조정 불필요.)
 - enroll/모델관리/UI/인증은 현재 범위 밖.

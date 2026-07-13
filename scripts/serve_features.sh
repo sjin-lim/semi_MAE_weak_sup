@@ -15,5 +15,7 @@ export EM_N_BLOCKS="${EM_N_BLOCKS:-1}"
 export EM_PORT="${EM_PORT:-8000}"
 export EM_HOST="${EM_HOST:-0.0.0.0}"
 export EM_CACHE_DIR="${EM_CACHE_DIR:-./.em_cache}"
+export EM_SERVER="${EM_SERVER:-waitress}"     # waitress(프로덕션) | flask(개발)
+export EM_THREADS="${EM_THREADS:-4}"          # waitress 스레드 수
 
 python inspection/service/feature_service.py "$@"

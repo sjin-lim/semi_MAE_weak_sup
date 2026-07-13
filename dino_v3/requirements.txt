@@ -8,3 +8,4 @@ termcolor
 torch
 torchmetrics
 torchvision
+waitress

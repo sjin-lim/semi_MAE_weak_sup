@@ -12,8 +12,12 @@
 # 기동 (서버, GPU 필요):
 #   EM_CONFIG=dino_v3/dinov3/configs/train/weaksup/stage2_ssl_weaksup.yaml \
 #   EM_CKPT=/path/to/teacher_checkpoint.pth \
-#   python service/feature_service.py
+#   python inspection/service/feature_service.py
 #   (또는 scripts/serve_features.sh)
+#
+# WSGI 서버: 기본 waitress(프로덕션·Windows 적합, 순수 파이썬). 미설치 시 Flask 개발 서버 폴백.
+#   EM_SERVER=waitress|flask, EM_THREADS=<int>(waitress 스레드 수).
+#   단일 GPU라 추론은 내부 _LOCK 으로 직렬화 → 멀티스레드는 큐잉/동시 요청 수신용.
 #
 # 엔드포인트:
 #   GET  /health              → 모델 정보
@@ -145,7 +149,22 @@ def main():
     _ensure_loaded()  # 기동 시 즉시 로드(실패를 바로 표면화)
     port = int(os.environ.get("EM_PORT", 8000))
     host = os.environ.get("EM_HOST", "0.0.0.0")
-    # threaded=True + 내부 _LOCK 으로 GPU 직렬화. 프로덕션은 gunicorn -w 1 --threads N 권장.
+    threads = int(os.environ.get("EM_THREADS", 4))
+    server = os.environ.get("EM_SERVER", "waitress").lower()  # waitress | flask
+
+    # 단일 GPU라 내부 _LOCK 으로 추론이 직렬화됨 → 멀티스레드 WSGI 로 큐잉/동시 요청 처리.
+    if server == "waitress":
+        try:
+            from waitress import serve
+        except ImportError:
+            logger.warning("waitress 미설치 → Flask 개발 서버로 폴백 (pip install waitress).")
+        else:
+            logger.info(f"waitress serve {host}:{port} (threads={threads}, GPU는 _LOCK 직렬화)")
+            serve(app, host=host, port=port, threads=threads)
+            return
+
+    # Flask 내장 서버 (개발/디버그용 — 프로덕션 아님)
+    logger.warning("Flask 개발 서버 사용 중 (프로덕션은 EM_SERVER=waitress 권장).")
     app.run(host=host, port=port, threaded=True)
 
 
