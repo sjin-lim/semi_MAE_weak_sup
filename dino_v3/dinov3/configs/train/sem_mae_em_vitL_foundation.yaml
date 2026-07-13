@@ -16,15 +16,27 @@
 #    고정 mask 0.1–0.4 로 타협 (0.3보다 boundary↑, 0.5보단 초반 noise-학습 안전).
 #    완전 0.5 원하면 4단계(pretrain→v7) 유지.
 #
-# 출발점: DINO 공개 ViT-L weight (student.pretrained_weights).
+# 출발점: 공개 DINOv3 ViT-L → (변환) → student.resume_from_teacher_chkpt.
+#   ⚠️ student.pretrained_weights 는 학습 코드가 안 읽는 dead 키다(부모 repo 문서에도 명시).
+#   ⚠️ 공개 .pth 는 {"teacher":...} 래핑/heads 가 없어서 resume 경로에 직접 넣으면
+#      KeyError 'teacher' 로 죽는다. 반드시 아래 변환 스크립트로 한 번 감싸서 쓸 것.
+#
+#   [0] 공개 weight → DINOv3 init 체크포인트 변환 (backbone 전이 + heads 랜덤):
+#     python tools/convert_to_dino_init.py \
+#         --ckpt /path/to/dinov3_vitl16_pretrain_lvd1689m-....pth \
+#         --output /path/to/dino_init_vitL.pth \
+#         --arch vit_large --img_size 448 \
+#         --dino_prototypes 65536 --ibot_prototypes 32768 \
+#         --dino_hidden_dim 2048 --ibot_hidden_dim 2048
 # ⚠️ 메모리: batch 128 OOM 이면 64 + OFFICIAL_EPOCH_LENGTH 2배(2500).
 #
 # 실행:
 #   python dinov3/train/train.py \
 #       --config-file dinov3/configs/train/sem_mae_em_vitL_foundation.yaml \
 #       train.dataset_path="WebDataset:path=/path/to/shards" \
-#       student.pretrained_weights=/path/to/dinov3_public_vitL.pth \
+#       student.resume_from_teacher_chkpt=/path/to/dino_init_vitL.pth \
 #       train.output_dir=/path/to/output_vitL_foundation
+#   → 시작 로그에 "Loading pretrained weights from /path/to/dino_init_vitL.pth" 떠야 성공.
 # ============================================================
 
 MODEL:
@@ -105,10 +117,11 @@ train:
 student:
   arch: vit_large                    # ← ViT-L
   patch_size: 16
-  # DINO 공개 ViT-L weight 경로. arch 파라미터(n_storage_tokens/ffn_layer/qkv_bias/
-  # rope)가 공개 weight 와 일치해야 init 이 전이됨.
-  pretrained_weights: ''
-  resume_from_teacher_chkpt: ''
+  # ⚠️ pretrained_weights 는 학습 코드가 안 읽는 dead 키 — 값 넣어도 무시됨.
+  #    공개 weight 는 tools/convert_to_dino_init.py 로 변환 후 resume_from_teacher_chkpt 로.
+  #    arch(n_storage_tokens/ffn_layer/qkv_bias/rope)가 변환 스크립트 --arch 기본값과 일치해야 함.
+  pretrained_weights: ''              # (dead) 사용 금지
+  resume_from_teacher_chkpt: ''       # ← CLI override: 변환된 dino_init_vitL.pth (backbone+랜덤heads)
   drop_path_rate: 0.1               # pretrained init → 약한 regularization
   layerscale: 1.0e-05
   drop_path_uniform: true
