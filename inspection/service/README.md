@@ -45,6 +45,8 @@ bash scripts/serve_features.sh
 ### `POST /features`
 - multipart: `image`(1장) 또는 `images`(여러 장)
 - 옵션 쿼리: `?feature_kind=cls|patchmean|concat` · `n_blocks=<int>` (기본은 서버 config)
+  - `?include=patch` → `result['patch']={h,w,n,d,dtype,b64}` (patch 격자, float32 base64).
+    patch-level anomaly/분류(descriptor) 용. 디코드: `np.frombuffer(base64.b64decode(b64),'<f4').reshape(n,d)`.
 - 응답:
 ```json
 {"model":{...}, "count":1,

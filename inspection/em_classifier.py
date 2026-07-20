@@ -327,6 +327,37 @@ class EMFeatureExtractor:
         """embed() 의 기본 설정 래퍼 (하위호환)."""
         return self.embed(images, batch_size=batch_size)
 
+    def embed_patches(self, images, n_blocks: Optional[int] = None, batch_size: int = 8):
+        """images → [(patch_feats[N, D] L2정규화 float32, h, w), ...] (이미지별 patch 격자).
+
+        patch-level anomaly/descriptor 용. N = h*w (마지막 n_blocks 블록의 patch tokens).
+        """
+        import torch
+        from PIL import Image
+
+        nb = n_blocks or self.n_blocks
+        if isinstance(images, Image.Image):
+            images = [images]
+        tf = self._transform()
+        device = torch.cuda.current_device()
+        out = []
+        with torch.inference_mode():
+            for i in range(0, len(images), batch_size):
+                batch = images[i:i + batch_size]
+                x = torch.stack([tf(im.convert("RGB")) for im in batch]).to(device)
+                with torch.autocast("cuda", dtype=self.autocast_dtype):
+                    outs = self.model.get_intermediate_layers(
+                        x, n=nb, reshape=True, return_class_token=True, norm=True
+                    )
+                grid = outs[-1][0].float()                       # [B, C, h, w]
+                B, C, h, w = grid.shape
+                g = grid.permute(0, 2, 3, 1).reshape(B, h * w, C)  # [B, N, C]
+                g = torch.nn.functional.normalize(g, dim=-1, p=2)
+                gc = g.cpu().numpy()
+                for b in range(B):
+                    out.append((gc[b].astype(np.float32), h, w))
+        return out
+
 
 # --------------------------------------------------------------------------- #
 # 4) end-to-end 분류기 (extractor + head)

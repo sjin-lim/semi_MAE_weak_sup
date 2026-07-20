@@ -23,7 +23,10 @@
 #   GET  /health              → 모델 정보
 #   POST /features            → multipart image(1) 또는 images(N) → embedding
 #        옵션 쿼리: ?feature_kind=cls|patchmean|concat & n_blocks=<int>
+#                  ?include=patch → patch 격자도 반환(result['patch']={h,w,n,d,b64=float32})
+#                    patch-level anomaly/classification(descriptor) 용
 
+import base64
 import io
 import logging
 import os
@@ -132,13 +135,23 @@ def features():
         except Exception as e:  # noqa: BLE001
             return jsonify({"error": f"이미지 디코드 실패({f.filename}): {e}"}), 400
 
+    want_patch = "patch" in request.args.get("include", "")
+
     with _LOCK:  # GPU 추론 직렬화
         feats = _EXTRACTOR.embed(imgs, feature_kind=feature_kind, n_blocks=n_blocks)
+        patches = _EXTRACTOR.embed_patches(imgs, n_blocks=n_blocks) if want_patch else None
 
-    results = [
-        {"filename": name, "dim": int(feats.shape[1]), "feature": feats[i].tolist()}
-        for i, name in enumerate(names)
-    ]
+    results = []
+    for i, name in enumerate(names):
+        item = {"filename": name, "dim": int(feats.shape[1]), "feature": feats[i].tolist()}
+        if patches is not None:
+            pf, h, w = patches[i]                       # [N, D] float32
+            item["patch"] = {
+                "h": int(h), "w": int(w), "n": int(pf.shape[0]), "d": int(pf.shape[1]),
+                "dtype": "float32",
+                "b64": base64.b64encode(np.ascontiguousarray(pf).tobytes()).decode("ascii"),
+            }
+        results.append(item)
     info = _model_info()
     info["feature_kind"] = feature_kind
     info["n_blocks"] = n_blocks
