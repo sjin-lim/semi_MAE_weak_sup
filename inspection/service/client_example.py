@@ -82,6 +82,32 @@ def get_features(server, image_paths, feature_kind=None, batch=16):
     return np.vstack(feats), names
 
 
+def _decode_patch(p):
+    """서버 result['patch'] → (feats[N,D] float32, h, w). ?include=patch 응답."""
+    arr = np.frombuffer(
+        __import__("base64").b64decode(p["b64"]), dtype=np.float32
+    ).reshape(int(p["n"]), int(p["d"]))
+    return arr, int(p["h"]), int(p["w"])
+
+
+def get_patch_features(server, image_paths, batch=8):
+    """이미지 경로들 → [(patch_feats[N,D], h, w, name), ...]  (/features?include=patch).
+
+    patch-level anomaly/localization/descriptor 실험용. 이미지별 patch 격자를 그대로 반환.
+    """
+    url = server.rstrip("/") + "/features?include=patch"
+    out = []
+    paths = list(image_paths)
+    for i in range(0, len(paths), batch):
+        chunk = paths[i:i + batch]
+        items = [(Path(p).name, Path(p).read_bytes()) for p in chunk]
+        resp = _post_multipart(url, items)
+        for r in resp["results"]:
+            pf, h, w = _decode_patch(r["patch"])
+            out.append((pf, h, w, r["filename"]))
+    return out
+
+
 def _list_images(path):
     p = Path(path)
     if p.is_dir():
