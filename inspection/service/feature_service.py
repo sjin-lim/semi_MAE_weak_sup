@@ -126,6 +126,12 @@ def features():
         n_blocks = int(request.args.get("n_blocks", _EXTRACTOR.n_blocks))
     except ValueError:
         return jsonify({"error": "n_blocks must be int"}), 400
+    # img_size: 요청별 입력 해상도 override (patch 격자 = img_size/patch_size). 미지정 시 서버 기본.
+    try:
+        img_size = request.args.get("img_size")
+        img_size = int(img_size) if img_size else None
+    except ValueError:
+        return jsonify({"error": "img_size must be int"}), 400
 
     imgs, names = [], []
     for f in files:
@@ -138,8 +144,8 @@ def features():
     want_patch = "patch" in request.args.get("include", "")
 
     with _LOCK:  # GPU 추론 직렬화
-        feats = _EXTRACTOR.embed(imgs, feature_kind=feature_kind, n_blocks=n_blocks)
-        patches = _EXTRACTOR.embed_patches(imgs, n_blocks=n_blocks) if want_patch else None
+        feats = _EXTRACTOR.embed(imgs, feature_kind=feature_kind, n_blocks=n_blocks, image_size=img_size)
+        patches = _EXTRACTOR.embed_patches(imgs, n_blocks=n_blocks, image_size=img_size) if want_patch else None
 
     results = []
     for i, name in enumerate(names):
@@ -155,6 +161,7 @@ def features():
     info = _model_info()
     info["feature_kind"] = feature_kind
     info["n_blocks"] = n_blocks
+    info["img_size"] = img_size or _EXTRACTOR.image_size
     return jsonify({"model": info, "count": len(results), "results": results})
 
 

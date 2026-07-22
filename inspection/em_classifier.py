@@ -288,13 +288,13 @@ class EMFeatureExtractor:
     def embed_dim(self) -> int:
         return self.model.embed_dim
 
-    def _transform(self):
+    def _transform(self, image_size: Optional[int] = None):
         from inspection.em_aug import build_em_eval_transform
 
-        return build_em_eval_transform(self.image_size)
+        return build_em_eval_transform(image_size or self.image_size)
 
     def embed(self, images, feature_kind: Optional[str] = None, n_blocks: Optional[int] = None,
-              batch_size: int = 32) -> np.ndarray:
+              batch_size: int = 32, image_size: Optional[int] = None) -> np.ndarray:
         """images: PIL.Image 또는 리스트 → np.ndarray [B, D] (L2 정규화).
 
         feature_kind / n_blocks 를 요청별로 override 가능(범용 feature 서비스용).
@@ -307,7 +307,7 @@ class EMFeatureExtractor:
         nb = n_blocks or self.n_blocks
         if isinstance(images, Image.Image):
             images = [images]
-        tf = self._transform()
+        tf = self._transform(image_size)
         device = torch.cuda.current_device()
         out = []
         with torch.inference_mode():
@@ -327,10 +327,12 @@ class EMFeatureExtractor:
         """embed() 의 기본 설정 래퍼 (하위호환)."""
         return self.embed(images, batch_size=batch_size)
 
-    def embed_patches(self, images, n_blocks: Optional[int] = None, batch_size: int = 8):
+    def embed_patches(self, images, n_blocks: Optional[int] = None, batch_size: int = 8,
+                      image_size: Optional[int] = None):
         """images → [(patch_feats[N, D] L2정규화 float32, h, w), ...] (이미지별 patch 격자).
 
         patch-level anomaly/descriptor 용. N = h*w (마지막 n_blocks 블록의 patch tokens).
+        image_size 를 주면 그 해상도로 resize(패치 격자 = image_size/patch_size). 미지정 시 self.image_size.
         """
         import torch
         from PIL import Image
@@ -338,7 +340,7 @@ class EMFeatureExtractor:
         nb = n_blocks or self.n_blocks
         if isinstance(images, Image.Image):
             images = [images]
-        tf = self._transform()
+        tf = self._transform(image_size)
         device = torch.cuda.current_device()
         out = []
         with torch.inference_mode():

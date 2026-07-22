@@ -90,12 +90,15 @@ def _decode_patch(p):
     return arr, int(p["h"]), int(p["w"])
 
 
-def get_patch_features(server, image_paths, batch=8):
+def get_patch_features(server, image_paths, batch=8, img_size=None):
     """이미지 경로들 → [(patch_feats[N,D], h, w, name), ...]  (/features?include=patch).
 
     patch-level anomaly/localization/descriptor 실험용. 이미지별 patch 격자를 그대로 반환.
+    img_size: 입력 해상도 override(패치 격자 = img_size/16). 미지정 시 서버 기본(EM_IMAGE_SIZE).
     """
     url = server.rstrip("/") + "/features?include=patch"
+    if img_size:
+        url += f"&img_size={int(img_size)}"
     out = []
     paths = list(image_paths)
     for i in range(0, len(paths), batch):
