@@ -75,6 +75,55 @@ flowchart TD
 
 ---
 
+## Localizer 상세 (kNN vs recon)
+
+anomaly map `a_i`(어디가 이상한가)를 만드는 두 방식. **typing residual 은 항상 kNN 최근접 정상 기준**이며,
+localizer 는 "이상 patch 선별(REGION_THR 게이트)"에만 영향.
+
+### kNN (기본, 무학습)
+- 정상 coreset `M` 과의 `a_i = 1 − (top-k cosine 평균)`.
+- 장점: 학습 불필요, 안정, 빠름. residual 참조(최근접 정상)와 메커니즘 공유.
+- 단점: coreset 구성에 민감하고, 관찰상 **결함이 아닌 맥락 유사 영역에 반응**하기도 함(localization 품질 낮음).
+
+### recon (옵션, Dinomaly-lite, torch)
+정상 feature 를 **재구성**하도록 얕은 transformer 를 정상만으로 학습 → 재구성 잔차를 이상도로 사용.
+
+**구조**
+```
+patch feature [N,D]
+  → Linear(D→m)
+  → (학습 시) noisy bottleneck: z += 𝒩(0,σ)          # identity-shortcut 방지
+  → TransformerEncoder(spatial self-attention, L층)   # 토큰(패치) 간 문맥 참조
+  → Linear(m→D) → L2
+  = 재구성 r_i
+```
+- **spatial self-attention**: "주변 패치로 보아 이 자리엔 어떤 정상 feature 가 와야 하나"를 학습 → 문맥 기반.
+- **noisy bottleneck**: 병목에 노이즈를 주입해 디코더가 입력을 그대로 복사(이상까지 복원)하는 것을 억제.
+
+**학습** (정상 이미지만)
+- 이미지별 토큰집합 `[N,D]` 배치, 손실 `= 1 − cosine(r_i, x_i)` 평균.
+- **hard-mining**(`RECON_HARDQ<1`): 고손실(어려운) 정상 토큰만 평균 → 정상 재구성 baseline 을 낮춰 잔차 대비를 선명하게.
+
+**추론**
+- `a_i = 1 − cosine(r_i, x_i)`. 정상은 잘 복원돼 낮고, 이상은 복원 실패로 높음.
+
+**특성**
+- 장점: 관찰상 **결함 위치를 정확히** 잡음(공간 문맥). coreset 크기 민감성 없음.
+- 단점: 학습 필요(torch/GPU). 이미지레벨 탐지점수(top-p% 등)는 **정상 대비 보정 없으면 노이즈**
+  (재구성 어려운 정상 패치도 잔차↑) → 단일라벨 실험에서 이미지레벨 det AUROC 가 kNN 보다 낮게 나오기도 함.
+  단, **typing 에는 위치가 중요**하므로 이 이미지레벨 탐지 약점과는 별개.
+
+**개선 로드맵**
+1. **multi-layer 재구성** — 여러 DINO layer(저/고수준)를 함께 재구성(= Dinomaly 최대 레버). **서비스가 다층 patch 반환** 필요.
+2. **linear / unstable attention** — identity-shortcut 추가 억제.
+3. **per-patch 정상 대비 잔차 정규화** — 정상 잔차 분포로 표준화 → 이미지레벨 탐지 개선.
+4. **recon 잔차를 typing residual 로도 사용** — 재구성 `r_i` 는 "그 패치의 기대 정상값"이라 `x_i − r_i` 를
+   맥락제거 residual 로 쓸 수 있음(현재는 kNN 최근접 정상 사용). 문맥 기반이라 더 깨끗할 여지.
+
+관련 파라미터: `RECON_M`(bottleneck), `RECON_LAYERS`, `RECON_EPOCHS`, `RECON_NOISE`(σ), `RECON_HARDQ`.
+
+---
+
 ## 파라미터
 
 | 이름 | 역할 | 기본 |
